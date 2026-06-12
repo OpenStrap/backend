@@ -1,0 +1,39 @@
+name = "openstrap-backend"
+compatibility_date = "2024-04-01"
+
+main = "src/index.ts"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "openstrap-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "RAW_BUCKET"
+bucket_name = "openstrap-raw"
+
+# Analytics queue (producer + consumer). DISABLED on this account: Cloudflare
+# Queues require the Workers Paid plan, which isn't enabled here (queue create
+# returns "specified queue settings are invalid"). The code path is fully
+# preserved — ingest.ts falls back to setting analytics_cursor.dirty=1 and the
+# hourly cron ("7 * * * *") + /admin/run-analytics process the work. To enable:
+# upgrade to Workers Paid, `wrangler queues create openstrap-analytics` +
+# `... -dlq`, then uncomment these blocks. The queue() consumer export in
+# index.ts is harmless to keep exported while the binding is absent.
+# [[queues.producers]]
+# binding = "ANALYTICS_Q"
+# queue = "openstrap-analytics"
+#
+# [[queues.consumers]]
+# queue = "openstrap-analytics"
+# max_batch_size = 20
+# max_batch_timeout = 30
+# max_retries = 3
+# dead_letter_queue = "openstrap-analytics-dlq"
+
+# Crons: hourly safety sweep (enqueue dirty users) + nightly re-derive/prune.
+[triggers]
+crons = ["7 * * * *", "30 3 * * *"]
+
+[vars]
+EMAIL_FROM_NAME = "OpenStrap"

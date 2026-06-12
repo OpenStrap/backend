@@ -1,0 +1,19 @@
+{
+  "name": "openstrap-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.0.0",
+    "openstrap-analytics": "file:../openstrap-analytics",
+    "openstrap-protocol": "file:../openstrap-protocol"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240000.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^3.0.0"
+  }
+}
