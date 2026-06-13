@@ -78,6 +78,14 @@ export async function getDayStrain(c: Ctx) {
     'WHERE user_id = ? AND start_ts >= ? AND start_ts < ? ORDER BY start_ts ASC',
   ).bind(c.get('userId'), start, start + DAY).all<any>()
 
+  // Training-load + day totals from the derived `daily` row (acwr/fitness/cals/steps + drivers).
+  const dr = await c.env.DB.prepare(
+    'SELECT acwr, fitness_trend, calories, steps, drivers FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(c.get('userId'), date).first<any>()
+  const acwr = dr?.acwr ?? null
+  const band = acwr == null ? null
+    : acwr < 0.8 ? 'detraining' : acwr <= 1.3 ? 'optimal' : acwr <= 1.5 ? 'caution' : 'high-risk'
+
   return c.json({
     date,
     strain: round1(strainScale(trimp)),
@@ -86,6 +94,12 @@ export async function getDayStrain(c: Ctx) {
     hr: { max: hrMax || null, min: hrMinNonZero || null, avg: hrN ? Math.round(hrSum / hrN) : null },
     max_hr_used: maxHr,
     worn_min: mins.filter((m) => m.wrist_on).length,
+    // Training load (ACWR band) + fitness trend + day energy/steps.
+    load: acwr == null ? null : { acwr: Math.round(acwr * 100) / 100, band },
+    fitness_trend: dr?.fitness_trend ?? null,
+    calories: dr?.calories ?? null,
+    steps: dr?.steps ?? null,
+    drivers: dr?.drivers ? safe(dr.drivers) : null,
     sessions: (sessions ?? []).map((s: any) => ({
       ...s, zones: s.zones ? safe(s.zones) : null,
       duration_min: s.end_ts && s.start_ts ? Math.round((s.end_ts - s.start_ts) / 60) : null,
