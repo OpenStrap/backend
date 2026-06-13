@@ -257,7 +257,7 @@ export async function getDayHeart(c: Ctx) {
   const mins = await loadMinutes(c, start, start + DAY)
   const userId = c.get('userId')
   const d = await c.env.DB.prepare(
-    'SELECT resting_hr, recovery, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hr_zones, nocturnal, stress, illness, drivers FROM daily WHERE user_id = ? AND date = ?',
+    'SELECT resting_hr, recovery, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hr_zones, nocturnal, stress, illness, drivers, resp_rate, resp_conf, spo2_idx FROM daily WHERE user_id = ? AND date = ?',
   ).bind(userId, date).first<any>()
   const base = await c.env.DB.prepare('SELECT resting_hr, hrv_rmssd FROM baselines WHERE user_id = ?')
     .bind(userId).first<any>()
@@ -279,6 +279,10 @@ export async function getDayHeart(c: Ctx) {
     nocturnal: parse(d?.nocturnal ?? null),
     stress: parse(d?.stress ?? null),
     illness: parse(d?.illness ?? null),
+    // Respiratory rate (RSA, gated) + relative SpO₂ now live under Heart.
+    resp: (d?.resp_rate != null && (d?.resp_conf ?? 0) >= 0.3)
+      ? { value: d.resp_rate, confidence: d.resp_conf } : null,
+    spo2: d?.spo2_idx != null ? { value: d.spo2_idx } : null,
     drivers: parse(d?.drivers ?? null),
   })
 }
