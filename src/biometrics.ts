@@ -9,6 +9,10 @@
 // express them as a deviation from the user's own baseline — relative, never absolute.
 
 import { parse_r24 } from 'openstrap-protocol/ts/records'
+import {
+  timeDomainHrv, freqDomainHrv, baevskyStressIndex,
+  calcRecovery, calcStress, calcIllness,
+} from 'openstrap-analytics'
 
 const DAY = 86400
 
@@ -101,44 +105,65 @@ async function restingSamples(env: BioEnv, userId: string, from: number, to: num
   return out
 }
 
-interface NightBio { date: string; rmssd: number | null; nBeats: number; temp: number | null; spo2: number | null }
+interface NightBio {
+  date: string
+  rmssd: number | null; sdnn: number | null; lfhf: number | null; si: number | null
+  resp: number | null; respConf: number; nBeats: number
+  temp: number | null; spo2: number | null
+  rr: number[] // time-ordered RR stream (ms) for stress scoring
+}
 
+/** Collect the time-ordered RR stream over a resting window + full HRV indices. */
 async function computeDay(env: BioEnv, userId: string, date: string, from: number, to: number, maxObjects: number): Promise<NightBio> {
-  const samples = await restingSamples(env, userId, from, to, maxObjects)
-  const { rmssd: hrv, nBeats } = rmssd(samples)
+  const samples = (await restingSamples(env, userId, from, to, maxObjects)).sort((a, b) => a.ts - b.ts)
+  const rr: number[] = []
+  for (const s of samples) for (const x of s.rr) rr.push(x)
+  const td = timeDomainHrv(rr)
+  const fd = freqDomainHrv(rr)
+  const si = baevskyStressIndex(rr)
   const temps = samples.map((s) => s.temp).filter((t) => t > 0)
   const spo2s = samples.map((s) => s.spo2).filter((s) => s > 0)
   return {
     date,
-    rmssd: hrv,
-    nBeats,
+    rmssd: td.rmssd, sdnn: td.sdnn, lfhf: fd.lf_hf, si: si.si,
+    resp: fd.resp_rate, respConf: fd.resp_conf, nBeats: td.n_beats,
     temp: temps.length ? median(temps) : null,
     spo2: spo2s.length ? median(spo2s) : null,
+    rr,
   }
 }
 
+interface DailyHistRow { date: string; resting_hr: number | null; hrv_rmssd: number | null; hrv_si: number | null; skin_temp_idx: number | null }
+
 /**
- * runBiometrics — for the last `days` days, re-decode resting V24 from R2 and
- * compute nightly HRV (RMSSD), plus median raw skin-temp / red-ADC. Writes
- * daily.hrv_rmssd/hrv_conf and the relative indices (night value − personal
- * baseline). Refreshes the HRV/temp/spo2 baselines (rolling medians). Heavy (R2
- * reads) → nightly cron / admin only, never inline ingest.
+ * runBiometrics — for the last `days` days, re-decode resting RR from R2 and
+ * compute the FULL HRV suite (RMSSD/SDNN/LF-HF/Baevsky-SI/resp), then derive the
+ * HRV-based metrics that need beat-to-beat data: RECOVERY (Plews lnRMSSD z-score),
+ * STRESS (Baevsky SI personal-relative), and the multivariate ILLNESS signal
+ * (Mahalanobis). Writes those + their drivers to the daily row. Heavy (R2 reads) →
+ * nightly cron / admin only, never inline ingest.
  */
 export async function runBiometrics(env: BioEnv, userId: string, days = 3): Promise<{ days: number; computed: number }> {
   const now = Math.floor(Date.now() / 1000)
-  const today = new Date(now * 1000).toISOString().slice(0, 10)
 
-  // Prefer real sleep windows; fall back to the calendar day so we still produce
-  // a number on nights sleep detection missed.
   const since = new Date((now - days * DAY) * 1000).toISOString().slice(0, 10)
   const { results: sleeps } = await env.DB.prepare(
     'SELECT date, onset_ts, wake_ts FROM sleep WHERE user_id = ? AND date >= ? AND onset_ts IS NOT NULL AND wake_ts IS NOT NULL',
   ).bind(userId, since).all<{ date: string; onset_ts: number; wake_ts: number }>()
   const sleepByDate = new Map((sleeps ?? []).map((s) => [s.date, s]))
 
-  // Per-request work budget: each R2 object holds ~50–90 records, so a small
-  // number of recent objects per day is plenty for RMSSD while staying inside the
-  // Worker CPU/subrequest limit. Newest day first; older days skip once spent.
+  // Prior history (for Plews baseline, personal SI baseline, illness covariance).
+  const { results: hist } = await env.DB.prepare(
+    'SELECT date, resting_hr, hrv_rmssd, hrv_si, skin_temp_idx FROM daily WHERE user_id = ? ORDER BY date DESC LIMIT 60',
+  ).bind(userId).all<DailyHistRow>()
+  const histRows = (hist ?? [])
+  const rhrByDate = new Map(histRows.map((h) => [h.date, h.resting_hr]))
+  const rmssdHist = histRows.map((h) => h.hrv_rmssd).filter((x): x is number => x != null)
+  const siHist = histRows.map((h) => h.hrv_si).filter((x): x is number => x != null)
+  const rhrHist = histRows.map((h) => h.resting_hr).filter((x): x is number => x != null)
+  const tempHist = histRows.map((h) => h.skin_temp_idx).filter((x): x is number => x != null)
+
+  // Per-request work budget (Worker CPU/subrequest limit). Newest day first.
   const PER_DAY = 12
   const TOTAL_OBJECTS = 24
   let spent = 0
@@ -147,7 +172,7 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3): Prom
     const dayStart = Math.floor((now - d * DAY) / DAY) * DAY
     const date = new Date(dayStart * 1000).toISOString().slice(0, 10)
     const budget = Math.min(PER_DAY, TOTAL_OBJECTS - spent)
-    if (budget <= 0) { out.push({ date, rmssd: null, nBeats: 0, temp: null, spo2: null }); continue }
+    if (budget <= 0) { out.push({ date, rmssd: null, sdnn: null, lfhf: null, si: null, resp: null, respConf: 0, nBeats: 0, temp: null, spo2: null, rr: [] }); continue }
     const sl = sleepByDate.get(date)
     const from = sl ? sl.onset_ts : dayStart
     const to = sl ? sl.wake_ts + 60 : dayStart + DAY
@@ -156,29 +181,55 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3): Prom
   }
 
   // Baselines: rolling medians over what we just computed + whatever's stored.
-  const hrvs = out.map((o) => o.rmssd).filter((x): x is number => x != null)
+  const allRmssd = [...out.map((o) => o.rmssd).filter((x): x is number => x != null), ...rmssdHist]
+  const allSi = [...out.map((o) => o.si).filter((x): x is number => x != null), ...siHist]
   const temps = out.map((o) => o.temp).filter((x): x is number => x != null)
   const spo2s = out.map((o) => o.spo2).filter((x): x is number => x != null)
-  const blHrv = hrvs.length ? median(hrvs) : null
+  const blHrv = allRmssd.length ? median(allRmssd) : null
+  const blSi = allSi.length ? median(allSi) : null
   const blTemp = temps.length ? median(temps) : null
   const blSpo2 = spo2s.length ? median(spo2s) : null
-  if (blHrv != null || blTemp != null || blSpo2 != null) {
+  if (blHrv != null || blTemp != null || blSpo2 != null || blSi != null) {
     await env.DB.prepare(
-      'UPDATE baselines SET hrv_rmssd = COALESCE(?, hrv_rmssd), skin_temp_raw = COALESCE(?, skin_temp_raw), spo2_raw = COALESCE(?, spo2_raw) WHERE user_id = ?',
-    ).bind(blHrv, blTemp, blSpo2, userId).run()
+      'UPDATE baselines SET hrv_rmssd = COALESCE(?, hrv_rmssd), hrv_si = COALESCE(?, hrv_si), skin_temp_raw = COALESCE(?, skin_temp_raw), spo2_raw = COALESCE(?, spo2_raw) WHERE user_id = ?',
+    ).bind(blHrv, blSi, blTemp, blSpo2, userId).run()
   }
 
   let computed = 0
   for (const o of out) {
-    // confidence from beat count: ~500 beats (a few hours of resting RR) → full.
     const conf = o.rmssd == null ? 0 : Math.round(Math.min(1, o.nBeats / 500) * 1000) / 1000
     const tempIdx = (o.temp != null && blTemp != null) ? Math.round((o.temp - blTemp) * 10) / 10 : null
     const spo2Idx = (o.spo2 != null && blSpo2 != null) ? Math.round((o.spo2 - blSpo2) * 10) / 10 : null
-    // Ensure a daily row exists, then patch the biometric columns.
+
+    // HRV-based metrics (all published algorithms; null when no usable RR).
+    const recovery = calcRecovery(o.rmssd, rmssdHist, { date: o.date })
+    const stress = calcStress(o.rr, siHist, { date: o.date })
+    const illness = calcIllness(
+      { resting_hr: rhrByDate.get(o.date) ?? null, rmssd: o.rmssd, skin_temp: tempIdx },
+      { resting_hr: rhrHist, rmssd: rmssdHist, skin_temp: tempHist },
+    )
+
+    // Merge bio-drivers into the day's driver graph (processUser writes the rest).
     await env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?, ?)').bind(userId, o.date).run()
+    const existing = await env.DB.prepare('SELECT drivers FROM daily WHERE user_id = ? AND date = ?')
+      .bind(userId, o.date).first<{ drivers: string | null }>()
+    let drivers: Record<string, unknown> = {}
+    try { drivers = existing?.drivers ? JSON.parse(existing.drivers) : {} } catch { drivers = {} }
+    if (recovery.drivers) drivers.recovery = recovery.drivers
+    if (stress.drivers) drivers.stress = stress.drivers
+    if (illness.drivers) drivers.illness = illness.drivers
+
     await env.DB.prepare(
-      'UPDATE daily SET hrv_rmssd = ?, hrv_conf = ?, skin_temp_idx = ?, spo2_idx = ?, updated_at = ? WHERE user_id = ? AND date = ?',
-    ).bind(o.rmssd, conf, tempIdx, spo2Idx, now, userId, o.date).run()
+      'UPDATE daily SET recovery = ?, hrv_rmssd = ?, hrv_conf = ?, hrv_sdnn = ?, hrv_lfhf = ?, hrv_si = ?, ' +
+      'resp_rate = COALESCE(?, resp_rate), resp_conf = COALESCE(?, resp_conf), ' +
+      'skin_temp_idx = ?, spo2_idx = ?, stress = ?, illness = ?, drivers = ?, updated_at = ? ' +
+      'WHERE user_id = ? AND date = ?',
+    ).bind(
+      recovery.score, o.rmssd, conf, o.sdnn, o.lfhf, o.si,
+      o.respConf >= 0.3 ? o.resp : null, o.respConf >= 0.3 ? o.respConf : null,
+      tempIdx, spo2Idx, JSON.stringify(stress), JSON.stringify(illness), JSON.stringify(drivers), now,
+      userId, o.date,
+    ).run()
     if (o.rmssd != null) computed++
   }
   return { days, computed }

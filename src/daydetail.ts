@@ -8,7 +8,6 @@
 // All JWT, scoped by user_id.
 
 import type { Context } from 'hono'
-import { classifyArousal } from 'openstrap-analytics'
 
 type Ctx = Context<{ Bindings: { DB: D1Database }; Variables: { userId: string } }>
 
@@ -171,53 +170,33 @@ export async function getDaySleep(c: Ctx) {
 }
 
 // ── /day/stress ──────────────────────────────────────────────────────────────
-// Per-minute arousal band (calm/balanced/stressed/active) from HR-above-resting
-// while sedentary. Mirrors calcStress exactly (same classifyArousal). NOT HRV.
+// HRV stress for the day (Baevsky SI + LF/HF, computed in biometrics.ts from RR)
+// + nocturnal arousal (sleep-stress), with a FACTUAL minute HR timeline for
+// context. No heuristic arousal banding — stress is the HRV value, not HR-elevation.
 export async function getDayStress(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
   const start = dayStartOf(date)
   const mins = await loadMinutes(c, start, start + DAY)
-  const { rhr, maxHr } = await loadHr(c)
 
-  const band: { t: number; b: string; s: number }[] = []
-  let calm = 0, balanced = 0, stressed = 0, active = 0, worn = 0
-  let reserveSum = 0, sedN = 0
-  const sed: { ts: number; s: number; on: boolean }[] = []
-  for (const m of mins) {
-    const p = classifyArousal(m.hr_avg ?? 0, m.activity ?? 0, !!m.wrist_on, rhr, maxHr)
-    band.push({ t: m.ts_min, b: p.bucket, s: p.score })
-    if (p.bucket === 'none') { sed.push({ ts: m.ts_min, s: 0, on: false }); continue }
-    worn++
-    if (p.bucket === 'active') { active++; sed.push({ ts: m.ts_min, s: 0, on: false }); continue }
-    reserveSum += p.reserve; sedN++
-    if (p.bucket === 'calm') calm++
-    else if (p.bucket === 'balanced') balanced++
-    else stressed++
-    sed.push({ ts: m.ts_min, s: p.score, on: true })
-  }
+  const userId = c.get('userId') as string
+  const row = await c.env.DB.prepare(
+    'SELECT stress, sleep_stress, drivers FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(userId, date).first<{ stress: string | null; sleep_stress: string | null; drivers: string | null }>()
+  const parse = (s: string | null) => { try { return s ? JSON.parse(s) : null } catch { return null } }
+  const stress = parse(row?.stress ?? null)
+  const sleepStress = parse(row?.sleep_stress ?? null)
+  const drivers = parse(row?.drivers ?? null)
 
-  const score = sedN > 0 ? Math.round(clamp(reserveSum / sedN / 0.35, 0, 1) * 100) : null
-
-  // Peak = highest 5-min rolling mean over sedentary minutes (≥3 in window).
-  let peak: { t: number; score: number } | null = null
-  const W = 5
-  for (let i = 0; i + W <= sed.length; i++) {
-    const win = sed.slice(i, i + W).filter((x) => x.on)
-    if (win.length < 3) continue
-    const mean = win.reduce((s, x) => s + x.s, 0) / win.length
-    if (!peak || mean > peak.score) peak = { t: sed[i + 2].ts, score: Math.round(mean) }
-  }
+  // Factual HR timeline (bpm) — context, not a stress band.
+  const hr = mins.map((m) => ({ t: m.ts_min, v: m.hr_avg ?? 0 }))
 
   return c.json({
     date,
-    score,
-    buckets: { calm, balanced, stressed, active },
-    worn_min: worn,
-    rhr_used: rhr,
-    max_hr_used: maxHr,
-    peak,
-    band: downsample(band, 240),
+    stress,         // {score, si, lf_hf, rmssd, level, drivers}
+    sleep_stress: sleepStress, // {score, arousal_events, restless_min, events[...]}
+    drivers: drivers?.stress ?? null,
+    hr: downsample(hr, 240),
   })
 }
 

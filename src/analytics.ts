@@ -9,10 +9,10 @@
 import {
   calcRestingHR, calcStrain, calcHrZones, calcCalories, calcSleep,
   calcSleepRegularity, detectSessions, calcLoad, calcFitnessTrend,
-  calcReadiness, calcAnomaly, calcBaselines, buildCoach,
-  calcStress, calcNocturnalHeart, buildNotifications,
+  calcAnomaly, calcBaselines, buildCoach,
+  calcSleepStress, calcNocturnalHeart, buildNotifications,
   type Minute, type Profile, type Baseline, type DayHistory,
-  type DailyStrain, type NightSummary, type SleepValue, type Metric,
+  type DailyStrain, type NightSummary, type SleepValue, type Metric, type Driver,
 } from 'openstrap-analytics'
 
 const DAY = 86400
@@ -102,10 +102,11 @@ interface DayBuf {
   sleep: Metric<SleepValue>
   wearMin: number
   steps: number
-  stress: string                  // calcStress JSON
+  sleepStress: string             // calcSleepStress JSON (nocturnal arousal)
   nocturnal: string               // calcNocturnalHeart JSON
   sleepingHr: number | null       // this night's sleeping-HR avg (for baseline)
   nocturnalElevated: boolean      // overnight HR notably above baseline
+  mainDrivers: Record<string, Driver[]>  // strain/rhr/sleep/zones driver graph
 }
 
 /**
@@ -134,6 +135,15 @@ export async function processUser(
 
   const profile = await loadProfile(db, userId)
   let baseline = await loadBaseline(db, userId)
+
+  // HRV recovery (computed in biometrics.ts from RR) is read back here to drive
+  // the coach. It may lag a run (biometrics runs after this on the cron) or be
+  // null until the first nocturnal RR is processed — the coach degrades to a
+  // neutral baseline when absent (it never fabricates a recovery number).
+  const { results: recRows } = await db.prepare(
+    'SELECT date, recovery FROM daily WHERE user_id = ? AND recovery IS NOT NULL ORDER BY date DESC LIMIT 60',
+  ).bind(userId).all<{ date: string; recovery: number }>()
+  const recoveryByDate = new Map((recRows ?? []).map((r) => [r.date, r.recovery]))
 
   // ── Pass 1: recompute baselines from prior derived history (last 30 days). ──
   const { results: histRows } = await db.prepare(
@@ -261,14 +271,30 @@ export async function processUser(
     const wearMin = dayMin.filter((m) => m.wrist_on).length
     const steps = Math.round(dayMin.reduce((s, m) => s + (m.steps || 0), 0))
 
-    // -- Stress / arousal monitor (HR-above-resting while sedentary; NOT HRV). --
-    const stress = calcStress(dayMin, baseline, profile)
-
     // -- Nocturnal heart (sleeping-HR dynamics over the main sleep period). --
     const sleepWorn = (sleep.onset_ts && sleep.wake_ts)
       ? sleepMin.filter((m) => m.ts >= sleep.onset_ts! && m.ts <= sleep.wake_ts!)
       : []
     const nocturnal = calcNocturnalHeart(sleepWorn, dayMin, baseline)
+
+    // -- Sleep stress / nocturnal arousal (HR surges + motion in sleep; NOT HRV;
+    //    the HRV-based daytime stress is computed in biometrics.ts from RR). --
+    const sleepStress = calcSleepStress(sleepWorn, baseline)
+
+    // -- Main-metric drivers (the cross-metric "what affected this" graph). --
+    const mainDrivers: Record<string, Driver[]> = {
+      strain: [
+        { label: 'Time in higher HR zones', contribution: Math.round(zones.zone3_min + zones.zone4_min + zones.zone5_min), detail: `${zones.zone3_min + zones.zone4_min + zones.zone5_min} min in Z3+`, ref: { metric: 'zones', date, scale: 'day' } },
+        { label: 'Workout sessions', contribution: 0, detail: 'auto-detected efforts', ref: { metric: 'sessions', date, scale: 'day' } },
+      ],
+      resting_hr: [
+        { label: 'Sleeping heart rate', contribution: rhr.resting_hr ?? 0, detail: rhr.resting_hr != null ? `${rhr.resting_hr} bpm` : '—', ref: { metric: 'hr', date, scale: 'day' } },
+      ],
+      sleep: [
+        { label: 'Time asleep', contribution: sleep.duration_min, detail: `${Math.round(sleep.duration_min)} min`, ref: { metric: 'sleep', date, scale: 'day' } },
+        { label: 'Efficiency', contribution: Math.round(sleep.efficiency * 100), detail: `${Math.round(sleep.efficiency * 100)}%`, ref: { metric: 'sleep', date, scale: 'day' } },
+      ],
+    }
 
     const sleepFlags = JSON.stringify({
       duration: flag(sleep, 'Sleep'),
@@ -292,10 +318,11 @@ export async function processUser(
 
     dayBuffer.push({
       date, dayStart, idx: dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin, steps,
-      stress: JSON.stringify(stress),
+      sleepStress: JSON.stringify(sleepStress),
       nocturnal: JSON.stringify(nocturnal),
       sleepingHr: nocturnal.sleeping_hr_avg,
       nocturnalElevated: nocturnal.elevated,
+      mainDrivers,
     })
   }
 
@@ -304,7 +331,7 @@ export async function processUser(
   //    across the history instead of collapsing to a single value). ──
   for (const buf of dayBuffer) {
     const { date, idx, rhr, strain, zones, calories, sleep, wearMin, steps,
-      stress, nocturnal, nocturnalElevated } = buf
+      sleepStress, nocturnal, nocturnalElevated, mainDrivers } = buf
 
     // Trailing windows ending at this day (inclusive).
     const sriNights = nightSummaries.slice(Math.max(0, idx - 13), idx + 1) // ~2 weeks
@@ -323,13 +350,9 @@ export async function processUser(
     const load = calcLoad(loadStrains)
     const fitness = calcFitnessTrend(fitnessHist)
 
-    const readiness = calcReadiness({
-      resting_hr: rhr.resting_hr,
-      sleep_duration_min: sleep.duration_min || null,
-      sleep_efficiency: sleep.efficiency || null,
-      sleep_regularity: sri.sri,
-      skin_temp: baseline.skin_temp ?? null,
-    }, baseline)
+    // Recovery is HRV-based, computed in biometrics.ts. Read the stored value for
+    // this day (may be null until RR is processed) — the coach degrades gracefully.
+    const recovery = recoveryByDate.get(date) ?? null
 
     const anomaly = calcAnomaly({
       recent_rhr: recentRhr,
@@ -341,7 +364,7 @@ export async function processUser(
     const flags = JSON.stringify({
       strain: flag(strain, 'Strain'),
       resting_hr: flag(rhr, 'Resting HR'),
-      readiness: flag(readiness, readiness.note),
+      recovery: { c: recovery != null ? 0.8 : 0, tier: 'HIGH', label: 'Recovery (HRV)' },
       calories: flag(calories, calories.label),
       zones: flag(zones, zones.max_hr_source === 'age' ? 'HR zones (estimated max HR)' : 'HR zones'),
       steps: { c: steps > 0 ? 0.5 : 0, tier: 'ESTIMATE', label: 'Steps (est.)' },
@@ -390,14 +413,10 @@ export async function processUser(
     }
     const rhrRecent = rhrSeries.slice(0, idx + 1).filter((x): x is number => x != null)
     const coach = buildCoach({
-      readiness: readiness.score,
-      readiness_components: readiness.components
-        ? {
-            rhr: readiness.components.rhr,
-            sleep_debt: readiness.components.sleep_debt,
-            sleep_quality: readiness.components.sleep_quality,
-          }
-        : null,
+      // HRV recovery drives the plan when present; absent → neutral 50 so the
+      // coach still produces sleep/load guidance (it never surfaces a fake number).
+      readiness: recovery ?? 50,
+      readiness_components: null,
       resting_hr: rhr.resting_hr,
       baseline_rhr: baseline.resting_hr,
       rhr_recent: rhrRecent,
@@ -412,37 +431,46 @@ export async function processUser(
       anomaly: bodyAlert ? JSON.parse(bodyAlert) : null,
     })
 
-    const confs = [strain.confidence, rhr.confidence, calories.confidence, readiness.confidence]
+    const confs = [strain.confidence, rhr.confidence, calories.confidence, sleep.confidence]
     const confidence = Math.round((confs.reduce((s, v) => s + v, 0) / confs.length) * 1000) / 1000
 
+    // Merge the main-metric drivers with any bio-drivers already stored by a
+    // prior biometrics run (recovery/stress/illness) so we never clobber them.
+    const driversJson = JSON.stringify(mainDrivers)
+
+    // NOTE: `readiness`, `stress`, `recovery`, `illness`, `drivers.recovery|stress|illness`
+    // are owned by biometrics.ts (HRV path) — processUser does NOT write them.
+    // It writes `drivers` (main metrics) via COALESCE-free set but biometrics
+    // read-merges, and on the hourly path (no biometrics) main drivers stand alone.
     statements.push(db.prepare(
-      'INSERT INTO daily (user_id, date, strain, resting_hr, readiness, calories, wear_min, steps, hr_zones, acwr, fitness_trend, anomaly, coach, stress, nocturnal, confidence, flags, updated_at) ' +
+      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, steps, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, confidence, flags, updated_at) ' +
       'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
-      'strain=excluded.strain, resting_hr=excluded.resting_hr, readiness=excluded.readiness, ' +
+      'strain=excluded.strain, resting_hr=excluded.resting_hr, ' +
       'calories=excluded.calories, wear_min=excluded.wear_min, steps=excluded.steps, hr_zones=excluded.hr_zones, ' +
       'acwr=excluded.acwr, fitness_trend=excluded.fitness_trend, anomaly=excluded.anomaly, coach=excluded.coach, ' +
-      'stress=excluded.stress, nocturnal=excluded.nocturnal, ' +
+      'nocturnal=excluded.nocturnal, sleep_stress=excluded.sleep_stress, ' +
+      'drivers=json_patch(COALESCE(daily.drivers,\'{}\'), excluded.drivers), ' +
       'confidence=excluded.confidence, flags=excluded.flags, updated_at=excluded.updated_at',
     ).bind(userId, date, strain.score, rhr.resting_hr == null ? null : Math.round(rhr.resting_hr),
-      readiness.score, calories.kcal,
+      calories.kcal,
       wearMin, steps, JSON.stringify(zones), load.acwr, fitness.direction,
-      bodyAlert, JSON.stringify(coach), stress, nocturnal,
+      bodyAlert, JSON.stringify(coach), nocturnal, sleepStress, driversJson,
       confidence, flags, now))
     dailyN++
 
     // ── Notifications (deterministic) — generate for the MOST RECENT day only
     //    (today). Idempotent by id=`${date}:${kind}`; preserves read state. ──
     if (idx === dayBuffer.length - 1) {
-      const stressObj = (() => { try { return JSON.parse(stress) } catch { return null } })()
+      const sleepStressObj = (() => { try { return JSON.parse(sleepStress) } catch { return null } })()
       const alertObj = bodyAlert ? (() => { try { return JSON.parse(bodyAlert) } catch { return null } })() : null
       const notifs = buildNotifications({
         date,
-        readiness: readiness.score,
+        readiness: recovery ?? 50,
         coach_summary: coach.summary ?? '',
         coach_top: coach.plan && coach.plan.length > 0
           ? { title: coach.plan[0].title, body: coach.plan[0].body } : null,
         body_alert: alertObj ? { kind: alertObj.kind, note: alertObj.note } : null,
-        stress_score: stressObj?.score ?? null,
+        stress_score: sleepStressObj?.score ?? null,
         nocturnal_elevated: nocturnalElevated,
         sleep_debt_min: sleepDebt,
         acwr: load.acwr,
