@@ -62,8 +62,14 @@ export async function getToday(c: Ctx) {
     date,
     // Deterministic coach plan + strain target + readiness contributors + summary.
     coach: daily?.coach ? safeParse(daily.coach) : null,
-    // Stress / arousal monitor summary (NOT HRV) — fills the waking day.
+    // HRV stress (Baevsky SI + LF/HF, personal-relative) — includes its drivers.
     stress: daily?.stress ? safeParse(daily.stress) : null,
+    // Multivariate illness signal (Mahalanobis) — "a signal, not a diagnosis".
+    illness: daily?.illness ? safeParse(daily.illness) : null,
+    // Nocturnal arousal / sleep-stress (HR surges + motion during sleep).
+    sleep_stress: daily?.sleep_stress ? safeParse(daily.sleep_stress) : null,
+    // Per-metric driver graph for today ("what affected what" — tappable in UI).
+    drivers: daily?.drivers ? safeParse(daily.drivers) : null,
     // Nocturnal-heart summary (sleeping-HR dynamics).
     nocturnal: daily?.nocturnal ? safeParse(daily.nocturnal) : null,
     // Respiratory rate (PPG) — GATED: only surfaced once it validates (conf ≥ 0.5).
@@ -98,7 +104,8 @@ export async function getToday(c: Ctx) {
         label: 'vs baseline',
         inputs_used: ['resting_hr', 'baseline.resting_hr'],
       },
-      readiness: metric(daily.readiness, 'score', 'Readiness (est.) — not HRV-based', df, 'readiness'),
+      // Recovery is HRV-based (Plews lnRMSSD z) — replaces the old heuristic readiness.
+      recovery: metric(daily.recovery, 'score', 'Recovery (HRV)', df, 'recovery'),
       calories: metric(daily.calories, 'kcal', 'Active calories (est.)', df, 'calories'),
       steps: metric(daily.steps, 'steps', 'Steps (est.)', df, 'steps'),
       // Wear is a direct count of worn minutes — full confidence when present
@@ -203,7 +210,7 @@ export async function getTrends(c: Ctx) {
   const baseline = await c.env.DB.prepare('SELECT * FROM baselines WHERE user_id = ?')
     .bind(userId).first<any>()
   const { results: daily } = await c.env.DB.prepare(
-    'SELECT date, strain, resting_hr, readiness, acwr, fitness_trend, wear_min, calories, anomaly FROM daily ' +
+    'SELECT date, strain, resting_hr, recovery AS readiness, acwr, fitness_trend, wear_min, calories, anomaly FROM daily ' +
     'WHERE user_id = ? ORDER BY date DESC LIMIT ?',
   ).bind(userId, days).all<any>()
   const { results: sleepRows } = await c.env.DB.prepare(

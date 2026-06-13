@@ -72,14 +72,19 @@ CREATE TABLE IF NOT EXISTS journal(
 -- ── DERIVED (permanent, tiny) ─────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS daily(
   user_id TEXT, date TEXT,
-  strain REAL, resting_hr INTEGER, readiness REAL,
+  strain REAL, resting_hr INTEGER, readiness REAL,  -- readiness DEPRECATED (heuristic) → see recovery
+  recovery REAL,                       -- HRV recovery 0..100 (Plews lnRMSSD z) — replaces readiness
   calories REAL, wear_min REAL, steps INTEGER,   -- calories = ACTIVE (est.); steps = detected (est.)
   hr_zones TEXT, acwr REAL, fitness_trend TEXT, anomaly TEXT,
   coach TEXT,                          -- deterministic coach plan (JSON)
-  stress TEXT,                         -- arousal monitor summary (JSON)
+  stress TEXT,                         -- HRV stress (Baevsky SI + LF/HF) (JSON, with drivers)
   nocturnal TEXT,                      -- nocturnal-heart summary (JSON)
-  resp_rate REAL, resp_conf REAL,      -- nightly respiratory rate (PPG; GATED)
+  resp_rate REAL, resp_conf REAL,      -- nightly respiratory rate (RSA from RR / PPG)
   hrv_rmssd REAL, hrv_conf REAL,       -- nocturnal HRV (RMSSD, ms) from beat-to-beat RR
+  hrv_sdnn REAL, hrv_lfhf REAL, hrv_si REAL,  -- SDNN + LF/HF (Lomb–Scargle) + Baevsky SI
+  illness TEXT,                        -- Mahalanobis illness signal (JSON, with drivers)
+  sleep_stress TEXT,                   -- nocturnal arousal / sleep-stress (JSON, with drivers)
+  drivers TEXT,                        -- per-metric driver graph for the day (JSON)
   skin_temp_idx REAL, spo2_idx REAL,   -- RELATIVE: raw ADC night value − personal baseline
   confidence REAL, flags TEXT, updated_at INTEGER,
   PRIMARY KEY(user_id, date)
@@ -98,9 +103,13 @@ CREATE TABLE IF NOT EXISTS sessions(
   start_ts INTEGER, end_ts INTEGER, type TEXT,
   avg_hr INTEGER, max_hr INTEGER, strain REAL, calories REAL, hrr60 INTEGER, zones TEXT,
   confidence REAL,
+  status TEXT,   -- 'live' | 'done'
+  source TEXT,   -- 'manual' (user started) | 'auto' (detected)
+  title TEXT,    -- optional user label
   PRIMARY KEY(user_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, start_ts);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(user_id, status);
 
 CREATE TABLE IF NOT EXISTS baselines(
   user_id TEXT PRIMARY KEY,
@@ -108,6 +117,7 @@ CREATE TABLE IF NOT EXISTS baselines(
   skin_temp REAL, chronic_strain REAL,
   sleeping_hr REAL, resp_rate REAL,    -- nocturnal-HR + respiratory baselines
   hrv_rmssd REAL, skin_temp_raw REAL, spo2_raw REAL,  -- HRV + raw temp/red-ADC baselines
+  hrv_si REAL,                         -- personal Baevsky-SI baseline (for relative stress)
   updated_at INTEGER
 );
 

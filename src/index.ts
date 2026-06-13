@@ -8,7 +8,9 @@ import { handleQueueBatch, type AnalyticsMessage } from './queue'
 import { getToday, getSleep, getStrain, getSessions, getTrends, getChart } from './query'
 import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
-import { getDayStrain, getDaySleep, getDayTimeline, getDayStress } from './daydetail'
+import { getDayStrain, getDaySleep, getDayTimeline, getDayStress, getDayHeart, getDayLungs } from './daydetail'
+import { getTrend } from './trend'
+import { workoutStart, workoutEnd, listWorkouts, getWorkout } from './workouts'
 import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { runRespRate } from './resp'
@@ -68,6 +70,9 @@ app.use('/history', requireJwt)
 app.use('/journal', requireJwt)
 app.use('/journal/*', requireJwt)
 app.use('/day/*', requireJwt)
+app.use('/trend/*', requireJwt)
+app.use('/workout/*', requireJwt)
+app.use('/workouts', requireJwt)
 app.use('/records', requireJwt)
 app.use('/notifications', requireJwt)
 app.use('/notifications/*', requireJwt)
@@ -219,6 +224,13 @@ app.get('/day/strain', getDayStrain)
 app.get('/day/sleep', getDaySleep)
 app.get('/day/timeline', getDayTimeline)
 app.get('/day/stress', getDayStress)
+app.get('/day/heart', getDayHeart)
+app.get('/day/lungs', getDayLungs)
+app.get('/trend/:metric', getTrend)
+app.post('/workout/start', workoutStart)
+app.post('/workout/end', workoutEnd)
+app.get('/workouts', listWorkouts)
+app.get('/workout/:id', getWorkout)
 app.get('/records', getRecords)
 app.get('/notifications', getNotifications)
 app.post('/notifications/read', markNotificationsRead)
@@ -226,12 +238,22 @@ app.post('/notifications/read', markNotificationsRead)
 // ========================= ADMIN =========================
 
 app.post('/admin/run-analytics', async (c) => {
-  const body = await c.req.json<{ user_id?: string; days?: number }>().catch(() => ({} as any))
+  const body = await c.req.json<{ user_id?: string; days?: number; bio?: boolean }>().catch(() => ({} as any))
+  const days = body.days ?? 3
   if (body.user_id) {
-    const res = await processUser(c.env.DB, body.user_id, { historyDays: body.days ?? 3 })
-    return c.json({ ok: true, ...res })
+    // Full re-derive sequence so HRV recovery feeds the coach:
+    //   1. processUser  — minute metrics (strain/RHR/sleep/sessions...) + daily rows
+    //   2. runBiometrics — HRV recovery/stress/illness from RR (needs daily RHR)
+    //   3. processUser  — coach picks up the recovery written in step 2
+    const r1 = await processUser(c.env.DB, body.user_id, { historyDays: days })
+    let bio: any = null
+    if (body.bio !== false) {
+      bio = await runBiometrics(c.env, body.user_id, days)
+      await processUser(c.env.DB, body.user_id, { historyDays: days })
+    }
+    return c.json({ ok: true, ...r1, bio })
   }
-  const res = await runAnalytics(c.env.DB, { historyDays: body.days ?? 3 })
+  const res = await runAnalytics(c.env.DB, { historyDays: days })
   return c.json({ ok: true, ...res })
 })
 

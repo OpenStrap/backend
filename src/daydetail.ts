@@ -8,7 +8,6 @@
 // All JWT, scoped by user_id.
 
 import type { Context } from 'hono'
-import { classifyArousal } from 'openstrap-analytics'
 
 type Ctx = Context<{ Bindings: { DB: D1Database }; Variables: { userId: string } }>
 
@@ -79,6 +78,14 @@ export async function getDayStrain(c: Ctx) {
     'WHERE user_id = ? AND start_ts >= ? AND start_ts < ? ORDER BY start_ts ASC',
   ).bind(c.get('userId'), start, start + DAY).all<any>()
 
+  // Training-load + day totals from the derived `daily` row (acwr/fitness/cals/steps + drivers).
+  const dr = await c.env.DB.prepare(
+    'SELECT acwr, fitness_trend, calories, steps, drivers FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(c.get('userId'), date).first<any>()
+  const acwr = dr?.acwr ?? null
+  const band = acwr == null ? null
+    : acwr < 0.8 ? 'detraining' : acwr <= 1.3 ? 'optimal' : acwr <= 1.5 ? 'caution' : 'high-risk'
+
   return c.json({
     date,
     strain: round1(strainScale(trimp)),
@@ -87,6 +94,12 @@ export async function getDayStrain(c: Ctx) {
     hr: { max: hrMax || null, min: hrMinNonZero || null, avg: hrN ? Math.round(hrSum / hrN) : null },
     max_hr_used: maxHr,
     worn_min: mins.filter((m) => m.wrist_on).length,
+    // Training load (ACWR band) + fitness trend + day energy/steps.
+    load: acwr == null ? null : { acwr: Math.round(acwr * 100) / 100, band },
+    fitness_trend: dr?.fitness_trend ?? null,
+    calories: dr?.calories ?? null,
+    steps: dr?.steps ?? null,
+    drivers: dr?.drivers ? safe(dr.drivers) : null,
     sessions: (sessions ?? []).map((s: any) => ({
       ...s, zones: s.zones ? safe(s.zones) : null,
       duration_min: s.end_ts && s.start_ts ? Math.round((s.end_ts - s.start_ts) / 60) : null,
@@ -171,53 +184,33 @@ export async function getDaySleep(c: Ctx) {
 }
 
 // ── /day/stress ──────────────────────────────────────────────────────────────
-// Per-minute arousal band (calm/balanced/stressed/active) from HR-above-resting
-// while sedentary. Mirrors calcStress exactly (same classifyArousal). NOT HRV.
+// HRV stress for the day (Baevsky SI + LF/HF, computed in biometrics.ts from RR)
+// + nocturnal arousal (sleep-stress), with a FACTUAL minute HR timeline for
+// context. No heuristic arousal banding — stress is the HRV value, not HR-elevation.
 export async function getDayStress(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
   const start = dayStartOf(date)
   const mins = await loadMinutes(c, start, start + DAY)
-  const { rhr, maxHr } = await loadHr(c)
 
-  const band: { t: number; b: string; s: number }[] = []
-  let calm = 0, balanced = 0, stressed = 0, active = 0, worn = 0
-  let reserveSum = 0, sedN = 0
-  const sed: { ts: number; s: number; on: boolean }[] = []
-  for (const m of mins) {
-    const p = classifyArousal(m.hr_avg ?? 0, m.activity ?? 0, !!m.wrist_on, rhr, maxHr)
-    band.push({ t: m.ts_min, b: p.bucket, s: p.score })
-    if (p.bucket === 'none') { sed.push({ ts: m.ts_min, s: 0, on: false }); continue }
-    worn++
-    if (p.bucket === 'active') { active++; sed.push({ ts: m.ts_min, s: 0, on: false }); continue }
-    reserveSum += p.reserve; sedN++
-    if (p.bucket === 'calm') calm++
-    else if (p.bucket === 'balanced') balanced++
-    else stressed++
-    sed.push({ ts: m.ts_min, s: p.score, on: true })
-  }
+  const userId = c.get('userId') as string
+  const row = await c.env.DB.prepare(
+    'SELECT stress, sleep_stress, drivers FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(userId, date).first<{ stress: string | null; sleep_stress: string | null; drivers: string | null }>()
+  const parse = (s: string | null) => { try { return s ? JSON.parse(s) : null } catch { return null } }
+  const stress = parse(row?.stress ?? null)
+  const sleepStress = parse(row?.sleep_stress ?? null)
+  const drivers = parse(row?.drivers ?? null)
 
-  const score = sedN > 0 ? Math.round(clamp(reserveSum / sedN / 0.35, 0, 1) * 100) : null
-
-  // Peak = highest 5-min rolling mean over sedentary minutes (≥3 in window).
-  let peak: { t: number; score: number } | null = null
-  const W = 5
-  for (let i = 0; i + W <= sed.length; i++) {
-    const win = sed.slice(i, i + W).filter((x) => x.on)
-    if (win.length < 3) continue
-    const mean = win.reduce((s, x) => s + x.s, 0) / win.length
-    if (!peak || mean > peak.score) peak = { t: sed[i + 2].ts, score: Math.round(mean) }
-  }
+  // Factual HR timeline (bpm) — context, not a stress band.
+  const hr = mins.map((m) => ({ t: m.ts_min, v: m.hr_avg ?? 0 }))
 
   return c.json({
     date,
-    score,
-    buckets: { calm, balanced, stressed, active },
-    worn_min: worn,
-    rhr_used: rhr,
-    max_hr_used: maxHr,
-    peak,
-    band: downsample(band, 240),
+    stress,         // {score, si, lf_hf, rmssd, level, drivers}
+    sleep_stress: sleepStress, // {score, arousal_events, restless_min, events[...]}
+    drivers: drivers?.stress ?? null,
+    hr: downsample(hr, 240),
   })
 }
 
@@ -264,5 +257,67 @@ export async function getDayTimeline(c: Ctx) {
       peak_hr: peak.v ? peak : null,
       low_hr: low.v ? low : null,
     },
+  })
+}
+
+// ── /day/heart ─────────────────────────────────────────────────────────────
+// Everything heart/autonomic for a day: 24h HR timeline, resting HR, HRV (RMSSD/
+// SDNN/LF-HF), recovery, HR-zone minutes, nocturnal-HR dynamics, stress + illness.
+// Recovery/stress/illness/HRV are read from the daily row (computed in biometrics).
+export async function getDayHeart(c: Ctx) {
+  const date = (c.req.query('date') || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const start = dayStartOf(date)
+  const mins = await loadMinutes(c, start, start + DAY)
+  const userId = c.get('userId')
+  const d = await c.env.DB.prepare(
+    'SELECT resting_hr, recovery, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hr_zones, nocturnal, stress, illness, drivers, resp_rate, resp_conf, spo2_idx FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(userId, date).first<any>()
+  const base = await c.env.DB.prepare('SELECT resting_hr, hrv_rmssd FROM baselines WHERE user_id = ?')
+    .bind(userId).first<any>()
+  const parse = (s: string | null) => { try { return s ? JSON.parse(s) : null } catch { return null } }
+  const worn = mins.filter((m) => m.wrist_on && (m.hr_avg ?? 0) > 0)
+  const hrs = worn.map((m) => m.hr_avg as number)
+  return c.json({
+    date,
+    hr: downsample(mins.map((m) => ({ t: m.ts_min, v: m.hr_avg ?? 0 })), 240),
+    avg_hr: hrs.length ? Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length) : null,
+    max_hr: hrs.length ? Math.round(Math.max(...hrs)) : null,
+    resting_hr: d?.resting_hr ?? null,
+    resting_hr_baseline: base?.resting_hr ?? null,
+    recovery: d?.recovery ?? null,
+    hrv: d?.hrv_rmssd != null
+      ? { rmssd: d.hrv_rmssd, sdnn: d.hrv_sdnn, lf_hf: d.hrv_lfhf, confidence: d.hrv_conf, baseline: base?.hrv_rmssd ?? null }
+      : null,
+    zones: d?.hr_zones ? parse(d.hr_zones) : null,
+    nocturnal: parse(d?.nocturnal ?? null),
+    stress: parse(d?.stress ?? null),
+    illness: parse(d?.illness ?? null),
+    // Respiratory rate (RSA, gated) + relative SpO₂ now live under Heart.
+    resp: (d?.resp_rate != null && (d?.resp_conf ?? 0) >= 0.3)
+      ? { value: d.resp_rate, confidence: d.resp_conf } : null,
+    spo2: d?.spo2_idx != null ? { value: d.spo2_idx } : null,
+    drivers: parse(d?.drivers ?? null),
+  })
+}
+
+// ── /day/lungs ─────────────────────────────────────────────────────────────
+// Respiratory rate (RSA from RR, gated on confidence) + relative SpO₂. Honest:
+// resp is null on nights without enough clean RR; SpO₂ is a baseline deviation,
+// never an absolute %.
+export async function getDayLungs(c: Ctx) {
+  const date = (c.req.query('date') || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId')
+  const d = await c.env.DB.prepare(
+    'SELECT resp_rate, resp_conf, spo2_idx, drivers FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(userId, date).first<any>()
+  const parse = (s: string | null) => { try { return s ? JSON.parse(s) : null } catch { return null } }
+  const respShown = d?.resp_rate != null && (d?.resp_conf ?? 0) >= 0.3
+  return c.json({
+    date,
+    resp_rate: respShown ? { value: d.resp_rate, confidence: d.resp_conf, unit: 'brpm', tier: 'ESTIMATE', label: 'Respiratory rate (RSA)' } : null,
+    spo2: d?.spo2_idx != null ? { value: d.spo2_idx, unit: 'Δ', tier: 'RELATIVE', label: 'Blood-oxygen vs baseline' } : null,
+    drivers: parse(d?.drivers ?? null),
   })
 }
