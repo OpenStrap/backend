@@ -26,7 +26,7 @@ interface SleepRow { date: string; duration_min: number | null; efficiency: numb
 export async function getRecords(c: Ctx) {
   const userId = c.get('userId')
   const { results: dailyRaw } = await c.env.DB.prepare(
-    'SELECT date, strain, resting_hr, readiness, wear_min, steps, nocturnal, coach FROM daily ' +
+    'SELECT date, strain, resting_hr, recovery AS readiness, wear_min, steps, nocturnal, coach FROM daily ' +
     'WHERE user_id = ? ORDER BY date ASC',
   ).bind(userId).all<DailyRow>()
   const { results: sleepRaw } = await c.env.DB.prepare(

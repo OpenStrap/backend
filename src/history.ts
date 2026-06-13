@@ -72,7 +72,7 @@ export async function getHistory(c: Ctx) {
 
   // Pull 2× the window so we can compute deltas vs the prior period in one query.
   const { results: dailyRows } = await c.env.DB.prepare(
-    'SELECT date, strain, resting_hr, readiness, calories, wear_min, steps, hr_zones, anomaly FROM daily ' +
+    'SELECT date, strain, resting_hr, recovery AS readiness, calories, wear_min, steps, hr_zones, anomaly FROM daily ' +
     'WHERE user_id = ? AND date >= ? ORDER BY date ASC',
   ).bind(userId, prevStartDate).all<any>()
   const { results: sleepRows } = await c.env.DB.prepare(

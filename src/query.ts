@@ -210,7 +210,7 @@ export async function getTrends(c: Ctx) {
   const baseline = await c.env.DB.prepare('SELECT * FROM baselines WHERE user_id = ?')
     .bind(userId).first<any>()
   const { results: daily } = await c.env.DB.prepare(
-    'SELECT date, strain, resting_hr, readiness, acwr, fitness_trend, wear_min, calories, anomaly FROM daily ' +
+    'SELECT date, strain, resting_hr, recovery AS readiness, acwr, fitness_trend, wear_min, calories, anomaly FROM daily ' +
     'WHERE user_id = ? ORDER BY date DESC LIMIT ?',
   ).bind(userId, days).all<any>()
   const { results: sleepRows } = await c.env.DB.prepare(

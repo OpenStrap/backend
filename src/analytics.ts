@@ -243,7 +243,7 @@ export async function processUser(
     // -- Strain / zones / active-calories over the calendar day. --
     const strain = calcStrain(dayMin, baseline, profile)
     const zones = calcHrZones(dayMin, baseline, profile)
-    const calories = calcCalories(dayMin, profile)
+    const calories = calcCalories(dayMin, profile, baseline.resting_hr, zones.max_hr_used)
     dailyStrains.push({ ts: dayStart, strain: strain.score })
 
     // -- Sessions for this day. --

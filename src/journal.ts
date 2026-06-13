@@ -96,7 +96,7 @@ export async function getJournalInsights(c: Ctx) {
   }
 
   const { results: daily } = await c.env.DB.prepare(
-    'SELECT date, resting_hr, readiness, strain FROM daily WHERE user_id = ? AND date >= ?',
+    'SELECT date, resting_hr, recovery AS readiness, strain FROM daily WHERE user_id = ? AND date >= ?',
   ).bind(userId, since).all<any>()
   const { results: sleep } = await c.env.DB.prepare(
     'SELECT date, efficiency, duration_min FROM sleep WHERE user_id = ? AND date >= ?',
