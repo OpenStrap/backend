@@ -132,8 +132,17 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
   // 6. Enqueue analytics (or mark dirty). Never run inline.
   if (minutesWritten > 0) await enqueueOrMarkDirty(c.env, userId, maxTsMin || Math.floor(Date.now() / 1000))
 
-  // 7. Respond.
-  return c.json({ ok: true, minutes_written: minutesWritten, raw_key: rawKey })
+  // 7. Respond. `received` = records persisted raw to R2 (the re-decodable system of
+  //    record); `decoded` = records that yielded a surfaceable sample; `minutes_written`
+  //    = per-minute rollups touched. The client shows `received` so the count is honest
+  //    (a 2xx means we stored them all), not 0.
+  return c.json({
+    ok: true,
+    received: records.length,
+    decoded: samples.length,
+    minutes_written: minutesWritten,
+    raw_key: rawKey,
+  })
 }
 
 // POST /ingest/events (JWT) { device_id, events: [hex,…] }
