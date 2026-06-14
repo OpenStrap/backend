@@ -31,12 +31,17 @@ export const hexToBytes = (hex: string): Uint8Array =>
 
 // Decode the R10 IMU arrays into (activity, steps) over the 100-sample window.
 //   activity = stddev of per-sample |accel|(g)  — actigraphy intensity.
-//   steps    = peaks in the gravity-removed magnitude within a step cadence
-//              band — real motion-derived step count (ESTIMATE tier: wrist
-//              accelerometry is inherently approximate). accel scale ÷4096 is
-//              physics-validated (|a|≈1g at rest).
-// A "step" = a magnitude peak above ACCEL_THRESH g that is ≥ MIN_GAP samples
-// from the previous peak (caps cadence ~ a few Hz so arm swings ≠ double-count).
+//   steps    = count of GAIT CYCLES only when the window is genuinely rhythmic.
+//
+// The band has no pedometer field — steps are estimated from wrist IMU (ESTIMATE
+// tier). The naive "count every peak" approach over-counts badly: any arm gesture,
+// typing, or vehicle bump clears a fixed threshold. Instead we require RHYTHM:
+// walking produces a periodic acceleration signal, so we (1) detrend the magnitude
+// to remove gravity + slow drift, (2) measure how periodic it is via normalized
+// autocorrelation over plausible step lags, and (3) only count steps when that
+// periodicity is strong AND the limb is actually moving. Steps in the window =
+// number of gait cycles = n / (dominant lag). Non-rhythmic motion → 0 steps.
+// (Same autocorrelation idea we use for respiratory rate; standard wrist pedometry.)
 function r10Motion(view: DataView, len: number): { activity: number; steps: number } {
   if (len < 685) return { activity: 0, steps: 0 }
   const ACC = 1 / 4096
@@ -55,23 +60,45 @@ function r10Motion(view: DataView, len: number): { activity: number; steps: numb
   for (let i = 0; i < n; i++) {
     mags.push(Math.hypot(ax[i] * ACC, ay[i] * ACC, az[i] * ACC))
   }
-  const mean = mags.reduce((s, v) => s + v, 0) / mags.length
-  const variance = mags.reduce((s, v) => s + (v - mean) ** 2, 0) / mags.length
-  const activity = Math.round(Math.sqrt(variance) * 1000) / 1000
+  const mean = mags.reduce((s, v) => s + v, 0) / n
+  const variance = mags.reduce((s, v) => s + (v - mean) ** 2, 0) / n
+  const std = Math.sqrt(variance)
+  const activity = Math.round(std * 1000) / 1000
 
-  // Step counting: peaks in the gravity-removed signal (mag − mean).
-  const ACCEL_THRESH = 0.18 // g above baseline to count as a footfall
-  const MIN_GAP = 6 // min samples between peaks (cadence cap)
-  let steps = 0
-  let lastPeak = -MIN_GAP;
-  for (let i = 1; i < n - 1; i++) {
-    const d = mags[i] - mean
-    if (d > ACCEL_THRESH && mags[i] >= mags[i - 1] && mags[i] > mags[i + 1] &&
-        i - lastPeak >= MIN_GAP) {
-      steps++
-      lastPeak = i
-    }
+  // Limb must actually be oscillating — quiet wrist (typing/holding) → no steps.
+  const ACTIVITY_FLOOR = 0.05 // g RMS of the detrended signal
+  if (std < ACTIVITY_FLOOR || n < 24) return { activity, steps: 0 }
+
+  // Detrend: remove a centered moving average (gravity + slow drift), leaving the
+  // gait oscillation around 0.
+  const W = 9
+  const x: number[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = 0, c = 0
+    for (let j = Math.max(0, i - W); j <= Math.min(n - 1, i + W); j++) { s += mags[j]; c++ }
+    x[i] = mags[i] - s / c
   }
+  const x0 = x.reduce((s, v) => s + v, 0) / n
+  let denom = 0
+  for (let i = 0; i < n; i++) denom += (x[i] - x0) ** 2
+  if (denom <= 1e-9) return { activity, steps: 0 }
+
+  // Normalized autocorrelation over plausible step lags. Cadence ~1.4–3.0 steps/s;
+  // with a ~25 Hz IMU window that's ~8–18 samples/step. We scan a generous band
+  // and rely on the periodicity strength to confirm gait.
+  const MIN_LAG = 7, MAX_LAG = 40
+  let bestLag = 0, bestR = 0
+  for (let lag = MIN_LAG; lag <= Math.min(MAX_LAG, n - 1); lag++) {
+    let num = 0
+    for (let i = 0; i < n - lag; i++) num += (x[i] - x0) * (x[i + lag] - x0)
+    const r = num / denom
+    if (r > bestR) { bestR = r; bestLag = lag }
+  }
+
+  // Strong, sustained periodicity ⇒ walking/running; count the gait cycles.
+  const RHYTHM_THRESH = 0.45
+  if (bestLag === 0 || bestR < RHYTHM_THRESH) return { activity, steps: 0 }
+  const steps = Math.round(n / bestLag)
   return { activity, steps }
 }
 

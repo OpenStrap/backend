@@ -15,6 +15,7 @@ import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { runRespRate } from './resp'
 import { runBiometrics } from './biometrics'
+import { runStepsImu } from './steps_imu'
 import { seedInit, seedMinutes, seedAnalytics } from './seed'
 
 type Bindings = {
@@ -381,14 +382,33 @@ export default {
           ).bind(since).all<{ user_id: string }>()
           for (const u of users ?? []) await runBiometrics(env, u.user_id, 3)
         } catch (e) { console.error('biometrics cron failed', e) }
+        // Steps from the wrist IMU (R10 + 0x33 re-decode → AN-2554 pedometer).
+        try {
+          const since = new Date(Date.now() - 2 * DAY * 1000).toISOString().slice(0, 10)
+          const { results: users } = await env.DB.prepare(
+            'SELECT DISTINCT user_id FROM daily WHERE date >= ?',
+          ).bind(since).all<{ user_id: string }>()
+          for (const u of users ?? []) await runStepsImu(env, u.user_id, 2)
+        } catch (e) { console.error('steps cron failed', e) }
         const cutoff = Math.floor(Date.now() / 1000) - 90 * DAY
         await env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
       })())
     } else {
-      // Hourly safety net: enqueue / process any dirty users the queue missed.
-      ctx.waitUntil(runAnalytics(env.DB, { historyDays: 3 }))
-      // Close forgotten live workouts whose HR has returned to baseline.
-      ctx.waitUntil(autoCloseStaleWorkouts(env.DB))
+      ctx.waitUntil((async () => {
+        // Hourly safety net: process any dirty users, then close stale workouts.
+        await runAnalytics(env.DB, { historyDays: 3 })
+        await autoCloseStaleWorkouts(env.DB)
+        // Steps LAST so the IMU-derived value (AN-2554) is authoritative over the
+        // minute-based one analytics writes. Refresh today + yesterday for users
+        // active in the last 2h (bounded R2 reads).
+        try {
+          const since = Math.floor(Date.now() / 1000) - 2 * 3600
+          const { results: users } = await env.DB.prepare(
+            'SELECT DISTINCT user_id FROM minute WHERE ts_min >= ?',
+          ).bind(since).all<{ user_id: string }>()
+          for (const u of users ?? []) await runStepsImu(env, u.user_id, 2)
+        } catch (e) { console.error('steps hourly cron failed', e) }
+      })())
     }
   },
 }
