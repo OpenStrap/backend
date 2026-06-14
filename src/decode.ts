@@ -29,6 +29,52 @@ export interface DecodedSample {
 export const hexToBytes = (hex: string): Uint8Array =>
   new Uint8Array(hex.trim().match(/.{1,2}/g)!.map((b) => parseInt(b, 16)))
 
+/** One IMU frame's accel as ordered magnitude samples (g) + its time + sub-order. */
+export interface ImuFrame { ts: number; idx: number; mags: number[] }
+
+// frameAccel — decode one IMU frame's accelerometer into ordered |accel|(g)
+// samples. Handles BOTH channels the strap streams:
+//   • 0x33 live IMU stream — ts@4, sub-frame idx@14, 10 accel samples
+//     (X[0:10],Y[10:20],Z[20:30]) from offset 24, scale 1/4096.
+//   • R10 (rec 0x0A) — ts@7, 100 accel samples @85/285/485, scale 1/4096.
+// Returns null if it isn't an accel-bearing frame. Used by the backend steps
+// runner (steps_imu.ts) to rebuild the signal for the AN-2554 pedometer that
+// now lives in openstrap-analytics (calcSteps). Kept here with the other IMU
+// decoders (see r10Motion) so all byte-offset knowledge stays in one place.
+export function frameAccel(hex: string): ImuFrame | null {
+  let b: Uint8Array
+  try { b = hexToBytes(hex) } catch { return null }
+  if (b.length < 32) return null
+  const view = new DataView(b.buffer, b.byteOffset, b.byteLength)
+  const pkt = b[0], rec = b[1]
+  // 0x33 IMU stream: 10 accel samples (X,Y,Z) from offset 24.
+  if (pkt === 0x33 && b.length >= 84) {
+    const ts = view.getUint32(4, true)
+    const idx = view.getUint16(14, true)
+    const mags: number[] = []
+    for (let i = 0; i < 10; i++) {
+      const x = view.getInt16(24 + 2 * i, true)
+      const y = view.getInt16(24 + 2 * (10 + i), true)
+      const z = view.getInt16(24 + 2 * (20 + i), true)
+      mags.push(Math.sqrt(x * x + y * y + z * z) / 4096)
+    }
+    return ts > 0 ? { ts, idx, mags } : null
+  }
+  // R10: rec 0x0A, ts@7, accel X@85/Y@285/Z@485 (100 int16 each).
+  if (rec === 0x0a && b.length >= 685) {
+    const ts = view.getUint32(7, true)
+    const mags: number[] = []
+    for (let i = 0; i < 100; i++) {
+      const x = view.getInt16(85 + 2 * i, true)
+      const y = view.getInt16(285 + 2 * i, true)
+      const z = view.getInt16(485 + 2 * i, true)
+      mags.push(Math.sqrt(x * x + y * y + z * z) / 4096)
+    }
+    return ts > 0 ? { ts, idx: 0, mags } : null
+  }
+  return null
+}
+
 // Decode the R10 IMU arrays into (activity, steps) over the 100-sample window.
 //   activity = stddev of per-sample |accel|(g)  — actigraphy intensity.
 //   steps    = count of GAIT CYCLES only when the window is genuinely rhythmic.
