@@ -256,9 +256,11 @@ export async function processUser(
     hrrSeries.push(dayHrr)
 
     // Only clear AUTO-detected sessions — manually-started / live workouts are
-    // user-owned and must survive a re-derive.
+    // user-owned and must survive a re-derive. Deleted tombstones are KEPT so a
+    // user-deleted auto session isn't resurrected (its row's status stays
+    // 'deleted'; the re-insert below only updates non-status fields via ON CONFLICT).
     statements.push(
-      db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto')")
+      db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND status != 'deleted'")
         .bind(userId, dayStart, dayStart + DAY),
     )
     for (const s of sessions) {

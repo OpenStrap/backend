@@ -75,7 +75,7 @@ export async function getDayStrain(c: Ctx) {
 
   const { results: sessions } = await c.env.DB.prepare(
     'SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones FROM sessions ' +
-    'WHERE user_id = ? AND start_ts >= ? AND start_ts < ? ORDER BY start_ts ASC',
+    "WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND status != 'deleted' ORDER BY start_ts ASC",
   ).bind(c.get('userId'), start, start + DAY).all<any>()
 
   // Training-load + day totals from the derived `daily` row (acwr/fitness/cals/steps + drivers).
@@ -307,7 +307,7 @@ export async function getDayTimeline(c: Ctx) {
     'SELECT onset_ts, wake_ts, duration_min FROM sleep WHERE user_id = ? AND wake_ts >= ? AND onset_ts < ?',
   ).bind(c.get('userId'), start - DAY, end).all<any>()
   const { results: sessions } = await c.env.DB.prepare(
-    'SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? ORDER BY start_ts ASC',
+    "SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND status != 'deleted' ORDER BY start_ts ASC",
   ).bind(c.get('userId'), start, end).all<any>()
   const { results: events } = await c.env.DB.prepare(
     'SELECT event_id, ts FROM events WHERE user_id = ? AND ts >= ? AND ts < ? ORDER BY ts ASC',

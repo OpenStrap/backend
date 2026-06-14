@@ -10,7 +10,7 @@ import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
 import { getDayStrain, getDaySleep, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
 import { getTrend } from './trend'
-import { workoutStart, workoutEnd, listWorkouts, getWorkout, autoCloseStaleWorkouts } from './workouts'
+import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts } from './workouts'
 import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { runRespRate } from './resp'
@@ -232,6 +232,7 @@ app.post('/workout/start', workoutStart)
 app.post('/workout/end', workoutEnd)
 app.get('/workouts', listWorkouts)
 app.get('/workout/:id', getWorkout)
+app.delete('/workout/:id', deleteWorkout)
 app.get('/records', getRecords)
 app.get('/notifications', getNotifications)
 app.post('/notifications/read', markNotificationsRead)

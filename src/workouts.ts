@@ -102,6 +102,18 @@ export async function workoutEnd(c: Ctx) {
   return c.json({ workout_id: body.workout_id, end_ts: end, ...b })
 }
 
+// DELETE /workout/:id → soft-delete (tombstone). We DON'T hard-delete because
+// auto-detected sessions would just be re-created on the next analytics re-derive;
+// the tombstone (status='deleted') is respected by detectSessions so it stays gone.
+export async function deleteWorkout(c: Ctx) {
+  const userId = c.get('userId')
+  const id = c.req.param('id')
+  const r = await c.env.DB.prepare(
+    "UPDATE sessions SET status = 'deleted' WHERE user_id = ? AND id = ?",
+  ).bind(userId, id).run()
+  return c.json({ ok: true, deleted: r.meta?.changes ?? 0 })
+}
+
 const RANGE_DAYS: Record<string, number> = { week: 7, month: 35, quarter: 91, '7d': 7, '30d': 30, '90d': 90 }
 
 // GET /workouts?range=week|month|quarter → list + training-volume summary.
@@ -112,7 +124,7 @@ export async function listWorkouts(c: Ctx) {
   const from = nowSec() - days * DAY
   const { results } = await c.env.DB.prepare(
     'SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, status, source, title ' +
-    'FROM sessions WHERE user_id = ? AND start_ts >= ? ORDER BY start_ts DESC',
+    "FROM sessions WHERE user_id = ? AND start_ts >= ? AND status != 'deleted' ORDER BY start_ts DESC",
   ).bind(userId, from).all<any>()
   const rows = (results ?? []).map((r: any) => ({
     ...r,
@@ -160,7 +172,7 @@ export async function getWorkout(c: Ctx) {
   const id = c.req.param('id')
   const w = await c.env.DB.prepare('SELECT * FROM sessions WHERE user_id = ? AND id = ?')
     .bind(userId, id).first<any>()
-  if (!w) return c.json({ error: 'not found' }, 404)
+  if (!w || w.status === 'deleted') return c.json({ error: 'not found' }, 404)
   const end = w.end_ts && w.end_ts > w.start_ts ? w.end_ts : nowSec() // live → up to now
   const mins = await loadMinutes(c.env.DB, userId, w.start_ts, end)
   const tail = await loadMinutes(c.env.DB, userId, end, end + 4 * 60) // for recovery curve

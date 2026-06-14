@@ -198,7 +198,7 @@ export async function getSessions(c: Ctx) {
   const from = parseInt(c.req.query('from') || '0')
   const to = parseInt(c.req.query('to') || String(nowSec()))
   const { results } = await c.env.DB.prepare(
-    'SELECT * FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts <= ? ORDER BY start_ts DESC LIMIT 200',
+    "SELECT * FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts <= ? AND status != 'deleted' ORDER BY start_ts DESC LIMIT 200",
   ).bind(c.get('userId'), from, to).all<any>()
   const rows = (results ?? []).map((r: any) => ({
     ...r,
