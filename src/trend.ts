@@ -33,6 +33,13 @@ interface DayRow {
   calories: number | null; steps: number | null; wear_min: number | null
   hrv_rmssd: number | null; resp_rate: number | null; stress: string | null
   duration_min: number | null // from sleep
+  // Trends & Fitness additions
+  readiness: number | null; vo2max: number | null
+  fitness: number | null; fatigue: number | null; form: number | null; monotony: number | null
+  hrv_sdnn: number | null; hrv_lfhf: number | null; hrv_si: number | null; hrv_cv: number | null
+  nocturnal_dip_pct: number | null; acwr: number | null
+  efficiency: number | null; deep_min: number | null; rem_min: number | null
+  light_min: number | null; regularity: number | null // from sleep
 }
 
 const REGISTRY: Record<string, MetricDef> = {
@@ -43,6 +50,25 @@ const REGISTRY: Record<string, MetricDef> = {
   hrv:         { pull: (r) => r.hrv_rmssd,   unit: 'ms',   label: 'HRV (RMSSD)' },
   calories:    { pull: (r) => r.calories,    unit: 'kcal', label: 'Active calories' },
   steps:       { pull: (r) => r.steps,       unit: '',     label: 'Steps' },
+  wear:        { pull: (r) => r.wear_min,    unit: 'min',  label: 'Wear time' },
+  // Trends & Fitness
+  readiness:   { pull: (r) => r.readiness,   unit: '',     label: 'Readiness' },
+  vo2max:      { pull: (r) => r.vo2max,      unit: 'ml/kg/min', label: 'VO₂max' },
+  fitness:     { pull: (r) => r.fitness,     unit: '',     label: 'Fitness' },
+  fatigue:     { pull: (r) => r.fatigue,     unit: '',     label: 'Fatigue' },
+  form:        { pull: (r) => r.form,        unit: '',     label: 'Form' },
+  monotony:    { pull: (r) => r.monotony,    unit: '',     label: 'Monotony' },
+  acwr:        { pull: (r) => r.acwr,        unit: '',     label: 'Training load (ACWR)' },
+  sdnn:        { pull: (r) => r.hrv_sdnn,    unit: 'ms',   label: 'HRV (SDNN)' },
+  lf_hf:       { pull: (r) => r.hrv_lfhf,    unit: '',     label: 'LF / HF' },
+  hrv_si:      { pull: (r) => r.hrv_si,      unit: '',     label: 'Stress index' },
+  hrv_cv:      { pull: (r) => r.hrv_cv,      unit: '%',    label: 'HRV stability (CV)' },
+  dip:         { pull: (r) => r.nocturnal_dip_pct == null ? null : r.nocturnal_dip_pct * 100, unit: '%', label: 'Nocturnal HR dip' },
+  efficiency:  { pull: (r) => r.efficiency == null ? null : r.efficiency * 100, unit: '%', label: 'Sleep efficiency' },
+  deep:        { pull: (r) => r.deep_min,    unit: 'min',  label: 'Deep sleep' },
+  rem:         { pull: (r) => r.rem_min,     unit: 'min',  label: 'REM sleep' },
+  light:       { pull: (r) => r.light_min,   unit: 'min',  label: 'Light sleep' },
+  regularity:  { pull: (r) => r.regularity,  unit: '',     label: 'Sleep regularity (SRI)' },
   resp:        { pull: (r) => r.resp_rate,   unit: 'brpm', label: 'Respiratory rate' },
   sleep:       { pull: (r) => r.duration_min, unit: 'min', label: 'Sleep',
                  target: (_r, need) => need, goalDir: 'min' },
@@ -76,7 +102,10 @@ export async function getTrend(c: Ctx) {
 
   const { results } = await c.env.DB.prepare(
     'SELECT d.date AS date, d.strain, d.recovery, d.resting_hr, d.calories, d.steps, d.wear_min, ' +
-    'd.hrv_rmssd, d.resp_rate, d.stress, s.duration_min AS duration_min ' +
+    'd.hrv_rmssd, d.resp_rate, d.stress, d.readiness, d.vo2max, d.fitness, d.fatigue, d.form, ' +
+    'd.monotony, d.hrv_sdnn, d.hrv_lfhf, d.hrv_si, d.hrv_cv, d.nocturnal_dip_pct, d.acwr, ' +
+    's.duration_min AS duration_min, s.efficiency AS efficiency, s.deep_min AS deep_min, ' +
+    's.rem_min AS rem_min, s.light_min AS light_min, s.regularity AS regularity ' +
     'FROM daily d LEFT JOIN sleep s ON s.user_id = d.user_id AND s.date = d.date ' +
     'WHERE d.user_id = ? AND d.date >= ? AND d.date <= ? ORDER BY d.date ASC',
   ).bind(userId, dateOf(from), dateOf(anchor)).all<DayRow>()
