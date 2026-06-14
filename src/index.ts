@@ -8,7 +8,7 @@ import { handleQueueBatch, type AnalyticsMessage } from './queue'
 import { getToday, getSleep, getStrain, getSessions, getTrends, getChart } from './query'
 import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
-import { getDayStrain, getDaySleep, getDayTimeline, getDayStress, getDayHeart, getDayLungs } from './daydetail'
+import { getDayStrain, getDaySleep, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
 import { getTrend } from './trend'
 import { workoutStart, workoutEnd, listWorkouts, getWorkout } from './workouts'
 import { getRecords } from './records'
@@ -226,6 +226,7 @@ app.get('/day/timeline', getDayTimeline)
 app.get('/day/stress', getDayStress)
 app.get('/day/heart', getDayHeart)
 app.get('/day/lungs', getDayLungs)
+app.get('/day/wear', getDayWear)
 app.get('/trend/:metric', getTrend)
 app.post('/workout/start', workoutStart)
 app.post('/workout/end', workoutEnd)

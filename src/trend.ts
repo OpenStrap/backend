@@ -43,6 +43,7 @@ const REGISTRY: Record<string, MetricDef> = {
   hrv:         { pull: (r) => r.hrv_rmssd,   unit: 'ms',   label: 'HRV (RMSSD)' },
   calories:    { pull: (r) => r.calories,    unit: 'kcal', label: 'Active calories' },
   steps:       { pull: (r) => r.steps,       unit: '',     label: 'Steps' },
+  wear:        { pull: (r) => r.wear_min,    unit: 'min',  label: 'Wear time' },
   resp:        { pull: (r) => r.resp_rate,   unit: 'brpm', label: 'Respiratory rate' },
   sleep:       { pull: (r) => r.duration_min, unit: 'min', label: 'Sleep',
                  target: (_r, need) => need, goalDir: 'min' },

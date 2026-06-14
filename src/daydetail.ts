@@ -111,6 +111,69 @@ const strainScale = (trimp: number) => Math.min(21, Math.log(trimp + 1) / Math.l
 const round1 = (n: number) => Math.round(n * 10) / 10
 const safe = (s: any) => { try { return JSON.parse(s) } catch { return null } }
 
+// ── /day/wear ──────────────────────────────────────────────────────────────
+// How long the strap was actually on the wrist for a day, plus when. Built from
+// the minute table's per-minute wrist_on flag (the source of truth for wear_min).
+// Returns total worn minutes, coverage %, a 24-bin hourly coverage histogram,
+// first-on / last-off timestamps, the number of separate wear stretches, and the
+// longest off-wrist gap inside the worn window. UTC day, JWT-scoped.
+export async function getDayWear(c: Ctx) {
+  const date = (c.req.query('date') || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const start = dayStartOf(date)
+  const mins = await loadMinutes(c, start, start + DAY)
+
+  // 24 hourly bins of minutes-worn (0..60). Index by the minute's hour-of-day.
+  const hourly = Array.from({ length: 24 }, () => 0)
+  let wornMin = 0
+  let firstOn: number | null = null
+  let lastOn: number | null = null
+  let segments = 0
+  let prevWorn = false
+  // Gap tracking: longest run of not-worn minutes BETWEEN the first and last worn minute.
+  let longestGap = 0
+  for (const m of mins) {
+    const worn = !!m.wrist_on
+    const hour = Math.floor(((m.ts_min - start) % DAY) / 3600)
+    if (worn) {
+      wornMin++
+      if (hour >= 0 && hour < 24) hourly[hour]++
+      if (firstOn == null) firstOn = m.ts_min
+      lastOn = m.ts_min
+      if (!prevWorn) segments++
+    }
+    prevWorn = worn
+  }
+  // Longest off-wrist gap inside [firstOn, lastOn] (minutes the band wasn't on).
+  if (firstOn != null && lastOn != null) {
+    const wornSet = new Set(mins.filter((m) => m.wrist_on).map((m) => m.ts_min))
+    let gap = 0
+    for (let t = firstOn; t <= lastOn; t += 60) {
+      if (wornSet.has(t)) { if (gap > longestGap) longestGap = gap; gap = 0 }
+      else gap++
+    }
+    if (gap > longestGap) longestGap = gap
+  }
+
+  // Prefer the derived daily.wear_min when present (same source), else the live count.
+  const dr = await c.env.DB.prepare(
+    'SELECT wear_min FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(c.get('userId'), date).first<{ wear_min: number | null }>()
+  const wearMin = dr?.wear_min != null ? Math.round(dr.wear_min) : wornMin
+
+  return c.json({
+    date,
+    worn_min: wearMin,
+    coverage_pct: Math.round((wearMin / 1440) * 100),
+    hourly,                                   // [24] minutes worn per hour (0..60)
+    first_on: firstOn,                        // unix sec of first worn minute (null = never on)
+    last_on: lastOn,                          // unix sec of last worn minute
+    segments,                                 // number of separate on-wrist stretches
+    longest_off_min: longestGap,              // longest off-wrist gap inside the worn window
+    tier: 'AUTH',                             // straight from the device's wrist sensor
+  })
+}
+
 // ── /day/sleep ───────────────────────────────────────────────────────────────
 export async function getDaySleep(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
