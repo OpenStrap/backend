@@ -81,6 +81,8 @@ export async function getToday(c: Ctx) {
       ? {
           rmssd: Math.round(daily.hrv_rmssd * 10) / 10,
           confidence: daily.hrv_conf,
+          // Personal RMSSD baseline so clients can show HRV relative to "your normal".
+          baseline: baseline?.hrv_rmssd != null ? Math.round(baseline.hrv_rmssd * 10) / 10 : null,
           tier: 'HIGH',
           label: 'Nocturnal HRV (RMSSD)',
         }
