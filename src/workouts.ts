@@ -151,7 +151,10 @@ export async function listWorkouts(c: Ctx) {
   })
 }
 
-// GET /workout/:id → one workout's full breakdown + HR/activity timeline.
+// GET /workout/:id → full breakdown + HR/activity timeline + derived effort
+// analytics (zone bands w/ bpm ranges + %, min HR, HR drift, time-to-peak, the
+// HR-recovery curve, steps/cadence, wrist coverage). Derived fields are computed
+// on READ from the minute stream — no schema change, always re-derivable.
 export async function getWorkout(c: Ctx) {
   const userId = c.get('userId')
   const id = c.req.param('id')
@@ -160,15 +163,142 @@ export async function getWorkout(c: Ctx) {
   if (!w) return c.json({ error: 'not found' }, 404)
   const end = w.end_ts && w.end_ts > w.start_ts ? w.end_ts : nowSec() // live → up to now
   const mins = await loadMinutes(c.env.DB, userId, w.start_ts, end)
+  const tail = await loadMinutes(c.env.DB, userId, end, end + 4 * 60) // for recovery curve
+  const baseline = await loadBaseline(c.env.DB, userId)
+  const zones = w.zones ? safeParse(w.zones) : null
   const hr = mins.map((m) => ({ t: m.ts, v: m.hr_avg }))
+  const effort = deriveEffort(mins, tail, w, end, zones, baseline)
   return c.json({
     id: w.id, type: w.type, title: w.title, status: w.status, source: w.source,
     start_ts: w.start_ts, end_ts: w.end_ts,
     duration_min: Math.max(0, Math.round((end - w.start_ts) / 60)),
     avg_hr: w.avg_hr, max_hr: w.max_hr, strain: w.strain, calories: w.calories,
-    hrr60: w.hrr60, zones: w.zones ? safeParse(w.zones) : null,
-    hr,
+    hrr60: w.hrr60, zones, hr,
+    ...effort,
   })
+}
+
+const avg = (xs: number[]) => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0
+
+// Per-read effort analytics derived from the workout's minute stream.
+function deriveEffort(
+  mins: Minute[], tail: Minute[], w: any, end: number, zones: any, baseline: Baseline,
+) {
+  const worn = mins.filter((m) => m.wrist_on && m.hr_avg > 0)
+  const resting = baseline.resting_hr || 60
+
+  // Lowest HR seen during the effort.
+  const minHr = worn.length
+    ? Math.round(Math.min(...worn.map((m) => (m.hr_min && m.hr_min > 0 ? m.hr_min : m.hr_avg))))
+    : null
+
+  // Cardiac drift: 2nd-half vs 1st-half mean HR (positive = HR crept up = fatigue/heat).
+  let hrDriftPct: number | null = null
+  if (worn.length >= 6) {
+    const half = Math.floor(worn.length / 2)
+    const a = avg(worn.slice(0, half).map((m) => m.hr_avg))
+    const b = avg(worn.slice(half).map((m) => m.hr_avg))
+    if (a > 0) hrDriftPct = Math.round(((b - a) / a) * 1000) / 10
+  }
+
+  // Time from start to peak HR (minutes).
+  let timeToPeakMin: number | null = null
+  if (worn.length) {
+    let pkTs = 0, pkV = -1
+    for (const m of worn) { const v = m.hr_max || m.hr_avg; if (v > pkV) { pkV = v; pkTs = m.ts } }
+    if (pkTs > 0) timeToPeakMin = Math.max(0, Math.round((pkTs - w.start_ts) / 60))
+  }
+
+  // Zone bands with bpm ranges (50/60/70/80/90% of maxHR) + minutes + share.
+  const maxHrUsed = (zones?.max_hr_used) || baseline.max_hr || 190
+  const ZP = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  const ZN = ['Very light', 'Light', 'Moderate', 'Hard', 'Maximum']
+  const zmin = zones
+    ? [zones.zone1_min, zones.zone2_min, zones.zone3_min, zones.zone4_min, zones.zone5_min].map((x: any) => x || 0)
+    : [0, 0, 0, 0, 0]
+  const ztot = zmin.reduce((a: number, b: number) => a + b, 0)
+  const zoneBands = ZN.map((name, i) => ({
+    zone: i + 1, name,
+    lo: Math.round(ZP[i] * maxHrUsed),
+    hi: i === 4 ? Math.max(Math.round(maxHrUsed), w.max_hr || 0) : Math.round(ZP[i + 1] * maxHrUsed),
+    min: zmin[i],
+    pct: ztot > 0 ? Math.round((zmin[i] / ztot) * 100) : 0,
+  }))
+
+  // HR-recovery curve: drop from end-HR at 60/120/180s after the effort ends.
+  const recoveryCurve: { sec: number; hr: number; drop: number }[] = []
+  const endHr = worn.length ? worn[worn.length - 1].hr_avg : 0
+  const stream = [...mins, ...tail].filter((m) => m.hr_avg > 0)
+  const hrAt = (ts: number): number | null => {
+    let best: Minute | null = null, bestD = 90
+    for (const m of stream) { const d = Math.abs(m.ts - ts); if (d <= bestD) { bestD = d; best = m } }
+    return best ? best.hr_avg : null
+  }
+  if (endHr > 0 && tail.length) {
+    for (const sec of [60, 120, 180]) {
+      const v = hrAt(end + sec)
+      if (v != null) recoveryCurve.push({ sec, hr: Math.round(v), drop: Math.max(0, Math.round(endHr - v)) })
+    }
+  }
+
+  // Output: steps, cadence (steps/min over moving minutes), wrist coverage.
+  const steps = Math.round(mins.reduce((s, m) => s + (m.steps || 0), 0))
+  const movingMin = mins.filter((m) => (m.steps || 0) > 0).length
+  const cadenceSpm = movingMin > 0 ? Math.round(steps / movingMin) : null
+  const coveragePct = mins.length ? Math.round((worn.length / mins.length) * 100) : null
+
+  return {
+    min_hr: minHr,
+    hr_drift_pct: hrDriftPct,
+    time_to_peak_min: timeToPeakMin,
+    zone_bands: zoneBands,
+    recovery_curve: recoveryCurve,
+    steps,
+    cadence_spm: cadenceSpm,
+    coverage_pct: coveragePct,
+  }
+}
+
+// Auto-stop forgotten live workouts. Run from cron. A live session is closed when
+// HR has been back near resting for QUIET_MIN minutes (the effort clearly ended),
+// or after MAX_LIVE_HOURS as a hard safety cap. End time = the last elevated minute,
+// so a forgotten "stop" never inflates duration with idle time. Returns # closed.
+const QUIET_MIN = 12
+const MAX_LIVE_HOURS = 6
+export async function autoCloseStaleWorkouts(db: D1Database): Promise<number> {
+  const now = nowSec()
+  const { results } = await db.prepare(
+    "SELECT user_id, id, start_ts FROM sessions WHERE status = 'live'",
+  ).all<any>()
+  let closed = 0
+  for (const s of results ?? []) {
+    const baseline = await loadBaseline(db, s.user_id)
+    const resting = baseline.resting_hr || 60
+    const maxHr = baseline.max_hr || 190
+    const calm = resting + Math.max(15, Math.round(0.15 * (maxHr - resting))) // ~very-light effort
+    const mins = await loadMinutes(db, s.user_id, s.start_ts, now)
+    const worn = mins.filter((m) => m.wrist_on && m.hr_avg > 0)
+    const ageH = (now - s.start_ts) / 3600
+
+    let lastElevated = 0
+    for (const m of worn) if (m.hr_avg > calm) lastElevated = m.ts
+    const recent = worn.filter((m) => m.ts >= now - QUIET_MIN * 60)
+    const calmedDown = lastElevated > 0 && recent.length >= 3 && recent.every((m) => m.hr_avg <= calm)
+    const tooOld = ageH >= MAX_LIVE_HOURS
+    if (!calmedDown && !tooOld) continue
+
+    let end = lastElevated > 0 ? lastElevated + 60 : s.start_ts + 60
+    if (end > now) end = now
+    if (end <= s.start_ts) end = s.start_ts + 60
+    const b = await computeBreakdown(db, s.user_id, s.start_ts, end)
+    await db.prepare(
+      'UPDATE sessions SET end_ts = ?, status = "done", avg_hr = ?, max_hr = ?, strain = ?, ' +
+      'calories = ?, hrr60 = ?, zones = ?, confidence = ? WHERE user_id = ? AND id = ?',
+    ).bind(end, b.avgHr, b.maxHr, b.strain, b.calories, b.hrr60 == null ? null : Math.round(b.hrr60),
+      JSON.stringify(b.zones), b.confidence, s.user_id, s.id).run()
+    closed++
+  }
+  return closed
 }
 
 function safeParse(s: string) { try { return JSON.parse(s) } catch { return null } }

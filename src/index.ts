@@ -10,7 +10,7 @@ import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
 import { getDayStrain, getDaySleep, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
 import { getTrend } from './trend'
-import { workoutStart, workoutEnd, listWorkouts, getWorkout } from './workouts'
+import { workoutStart, workoutEnd, listWorkouts, getWorkout, autoCloseStaleWorkouts } from './workouts'
 import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { runRespRate } from './resp'
@@ -386,6 +386,8 @@ export default {
     } else {
       // Hourly safety net: enqueue / process any dirty users the queue missed.
       ctx.waitUntil(runAnalytics(env.DB, { historyDays: 3 }))
+      // Close forgotten live workouts whose HR has returned to baseline.
+      ctx.waitUntil(autoCloseStaleWorkouts(env.DB))
     }
   },
 }
