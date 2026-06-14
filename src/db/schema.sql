@@ -154,3 +154,22 @@ CREATE TABLE IF NOT EXISTS rate_limit(
   tokens REAL NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- Admin-controlled app config: OTA update pointer + home-screen alert banner.
+-- Singleton row (id = 1). Served (public) by GET /app/status, written by admin.
+CREATE TABLE IF NOT EXISTS app_config(
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  latest_version    TEXT,
+  latest_build      INTEGER,
+  apk_url           TEXT,
+  release_notes     TEXT,
+  min_build         INTEGER DEFAULT 0,
+  banner_active     INTEGER DEFAULT 0,
+  banner_id         TEXT,
+  banner_title      TEXT,
+  banner_text       TEXT,
+  banner_level      TEXT DEFAULT 'info',
+  banner_action_url TEXT,
+  updated_at        INTEGER
+);
+INSERT OR IGNORE INTO app_config (id) VALUES (1);

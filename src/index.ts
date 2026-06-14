@@ -15,6 +15,8 @@ import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { runRespRate } from './resp'
 import { runBiometrics } from './biometrics'
+import { runStepsImu } from './steps_imu'
+import { getAppStatus, adminGetConfig, adminSetConfig } from './appconfig'
 import { seedInit, seedMinutes, seedAnalytics } from './seed'
 
 type Bindings = {
@@ -79,6 +81,10 @@ app.use('/notifications/*', requireJwt)
 app.use('/admin/*', requireAdmin)
 
 app.get('/', (c) => c.json({ ok: true, service: 'openstrap-backend', ts: Math.floor(Date.now() / 1000) }))
+
+// Public app status (OTA update pointer + admin alert banner). No JWT: the update
+// prompt and a "service down" notice must reach clients even with an expired session.
+app.get('/app/status', getAppStatus)
 
 // ========================= AUTH =========================
 
@@ -239,6 +245,10 @@ app.post('/notifications/read', markNotificationsRead)
 
 // ========================= ADMIN =========================
 
+// App config — OTA update pointer + home-screen alert banner (see appconfig.ts).
+app.get('/admin/config', adminGetConfig)
+app.post('/admin/config', adminSetConfig)
+
 app.post('/admin/run-analytics', async (c) => {
   const body = await c.req.json<{ user_id?: string; days?: number; bio?: boolean }>().catch(() => ({} as any))
   const days = body.days ?? 3
@@ -381,14 +391,33 @@ export default {
           ).bind(since).all<{ user_id: string }>()
           for (const u of users ?? []) await runBiometrics(env, u.user_id, 3)
         } catch (e) { console.error('biometrics cron failed', e) }
+        // Steps from the wrist IMU (R10 + 0x33 re-decode → AN-2554 pedometer).
+        try {
+          const since = new Date(Date.now() - 2 * DAY * 1000).toISOString().slice(0, 10)
+          const { results: users } = await env.DB.prepare(
+            'SELECT DISTINCT user_id FROM daily WHERE date >= ?',
+          ).bind(since).all<{ user_id: string }>()
+          for (const u of users ?? []) await runStepsImu(env, u.user_id, 2)
+        } catch (e) { console.error('steps cron failed', e) }
         const cutoff = Math.floor(Date.now() / 1000) - 90 * DAY
         await env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
       })())
     } else {
-      // Hourly safety net: enqueue / process any dirty users the queue missed.
-      ctx.waitUntil(runAnalytics(env.DB, { historyDays: 3 }))
-      // Close forgotten live workouts whose HR has returned to baseline.
-      ctx.waitUntil(autoCloseStaleWorkouts(env.DB))
+      ctx.waitUntil((async () => {
+        // Hourly safety net: process any dirty users, then close stale workouts.
+        await runAnalytics(env.DB, { historyDays: 3 })
+        await autoCloseStaleWorkouts(env.DB)
+        // Steps LAST so the IMU-derived value (AN-2554) is authoritative over the
+        // minute-based one analytics writes. Refresh today + yesterday for users
+        // active in the last 2h (bounded R2 reads).
+        try {
+          const since = Math.floor(Date.now() / 1000) - 2 * 3600
+          const { results: users } = await env.DB.prepare(
+            'SELECT DISTINCT user_id FROM minute WHERE ts_min >= ?',
+          ).bind(since).all<{ user_id: string }>()
+          for (const u of users ?? []) await runStepsImu(env, u.user_id, 2)
+        } catch (e) { console.error('steps hourly cron failed', e) }
+      })())
     }
   },
 }
