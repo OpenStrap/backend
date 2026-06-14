@@ -12,6 +12,7 @@ import { parse_r24 } from 'openstrap-protocol/ts/records'
 import {
   timeDomainHrv, freqDomainHrv, baevskyStressIndex,
   calcRecovery, calcStress, calcIllness,
+  calcHrvStability, calcIrregular, calcReadinessIndex,
 } from 'openstrap-analytics'
 
 const DAY = 86400
@@ -148,9 +149,14 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3): Prom
 
   const since = new Date((now - days * DAY) * 1000).toISOString().slice(0, 10)
   const { results: sleeps } = await env.DB.prepare(
-    'SELECT date, onset_ts, wake_ts FROM sleep WHERE user_id = ? AND date >= ? AND onset_ts IS NOT NULL AND wake_ts IS NOT NULL',
-  ).bind(userId, since).all<{ date: string; onset_ts: number; wake_ts: number }>()
+    'SELECT date, onset_ts, wake_ts, duration_min FROM sleep WHERE user_id = ? AND date >= ? AND onset_ts IS NOT NULL AND wake_ts IS NOT NULL',
+  ).bind(userId, since).all<{ date: string; onset_ts: number; wake_ts: number; duration_min: number | null }>()
   const sleepByDate = new Map((sleeps ?? []).map((s) => [s.date, s]))
+
+  // Sleep-need baseline (for the composite Readiness sleep component).
+  const baseRow = await env.DB.prepare('SELECT sleep_need_min FROM baselines WHERE user_id = ?')
+    .bind(userId).first<{ sleep_need_min: number | null }>()
+  const sleepNeedMin = baseRow?.sleep_need_min ?? null
 
   // Prior history (for Plews baseline, personal SI baseline, illness covariance).
   const { results: hist } = await env.DB.prepare(
@@ -209,23 +215,40 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3): Prom
       { resting_hr: rhrHist, rmssd: rmssdHist, skin_temp: tempHist },
     )
 
-    // Merge bio-drivers into the day's driver graph (processUser writes the rest).
+    // HRV stability (CV of recent nightly RMSSD) + irregular-rhythm screen (RR).
+    const hrvStab = calcHrvStability([o.rmssd, ...rmssdHist].filter((x): x is number => x != null).slice(0, 14))
+    const irregular = calcIrregular(o.rr)
+
+    // Composite Readiness — recovery (HRV) ∩ sleep vs need ∩ nocturnal dip ∩ arousal.
+    // Read this day's dip + sleep-stress (written by processUser) alongside drivers.
     await env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?, ?)').bind(userId, o.date).run()
-    const existing = await env.DB.prepare('SELECT drivers FROM daily WHERE user_id = ? AND date = ?')
-      .bind(userId, o.date).first<{ drivers: string | null }>()
+    const existing = await env.DB.prepare('SELECT drivers, sleep_stress, nocturnal_dip_pct FROM daily WHERE user_id = ? AND date = ?')
+      .bind(userId, o.date).first<{ drivers: string | null; sleep_stress: string | null; nocturnal_dip_pct: number | null }>()
     let drivers: Record<string, unknown> = {}
     try { drivers = existing?.drivers ? JSON.parse(existing.drivers) : {} } catch { drivers = {} }
     if (recovery.drivers) drivers.recovery = recovery.drivers
     if (stress.drivers) drivers.stress = stress.drivers
     if (illness.drivers) drivers.illness = illness.drivers
 
+    const sleepStressScore = (() => { try { return existing?.sleep_stress ? JSON.parse(existing.sleep_stress)?.score ?? null : null } catch { return null } })()
+    const readiness = calcReadinessIndex({
+      recovery: recovery.score,
+      sleepDurationMin: sleepByDate.get(o.date)?.duration_min ?? null,
+      sleepNeedMin,
+      dipPct: existing?.nocturnal_dip_pct ?? null,
+      sleepStress: sleepStressScore,
+    })
+    if (readiness.drivers) drivers.readiness = readiness.drivers
+
     await env.DB.prepare(
       'UPDATE daily SET recovery = ?, hrv_rmssd = ?, hrv_conf = ?, hrv_sdnn = ?, hrv_lfhf = ?, hrv_si = ?, ' +
+      'hrv_cv = ?, irregular = ?, readiness = ?, ' +
       'resp_rate = COALESCE(?, resp_rate), resp_conf = COALESCE(?, resp_conf), ' +
       'skin_temp_idx = ?, spo2_idx = ?, stress = ?, illness = ?, drivers = ?, updated_at = ? ' +
       'WHERE user_id = ? AND date = ?',
     ).bind(
       recovery.score, o.rmssd, conf, o.sdnn, o.lfhf, o.si,
+      hrvStab.cv, JSON.stringify(irregular), readiness.score,
       o.respConf >= 0.3 ? o.resp : null, o.respConf >= 0.3 ? o.respConf : null,
       tempIdx, spo2Idx, JSON.stringify(stress), JSON.stringify(illness), JSON.stringify(drivers), now,
       userId, o.date,

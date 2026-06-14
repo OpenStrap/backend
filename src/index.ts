@@ -8,9 +8,9 @@ import { handleQueueBatch, type AnalyticsMessage } from './queue'
 import { getToday, getSleep, getStrain, getSessions, getTrends, getChart } from './query'
 import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
-import { getDayStrain, getDaySleep, getDayTimeline, getDayStress, getDayHeart, getDayLungs } from './daydetail'
+import { getDayStrain, getDaySleep, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
 import { getTrend } from './trend'
-import { workoutStart, workoutEnd, listWorkouts, getWorkout } from './workouts'
+import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts } from './workouts'
 import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { runRespRate } from './resp'
@@ -226,11 +226,13 @@ app.get('/day/timeline', getDayTimeline)
 app.get('/day/stress', getDayStress)
 app.get('/day/heart', getDayHeart)
 app.get('/day/lungs', getDayLungs)
+app.get('/day/wear', getDayWear)
 app.get('/trend/:metric', getTrend)
 app.post('/workout/start', workoutStart)
 app.post('/workout/end', workoutEnd)
 app.get('/workouts', listWorkouts)
 app.get('/workout/:id', getWorkout)
+app.delete('/workout/:id', deleteWorkout)
 app.get('/records', getRecords)
 app.get('/notifications', getNotifications)
 app.post('/notifications/read', markNotificationsRead)
@@ -385,6 +387,8 @@ export default {
     } else {
       // Hourly safety net: enqueue / process any dirty users the queue missed.
       ctx.waitUntil(runAnalytics(env.DB, { historyDays: 3 }))
+      // Close forgotten live workouts whose HR has returned to baseline.
+      ctx.waitUntil(autoCloseStaleWorkouts(env.DB))
     }
   },
 }

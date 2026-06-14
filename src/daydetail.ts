@@ -75,12 +75,12 @@ export async function getDayStrain(c: Ctx) {
 
   const { results: sessions } = await c.env.DB.prepare(
     'SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones FROM sessions ' +
-    'WHERE user_id = ? AND start_ts >= ? AND start_ts < ? ORDER BY start_ts ASC',
+    "WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND status != 'deleted' ORDER BY start_ts ASC",
   ).bind(c.get('userId'), start, start + DAY).all<any>()
 
   // Training-load + day totals from the derived `daily` row (acwr/fitness/cals/steps + drivers).
   const dr = await c.env.DB.prepare(
-    'SELECT acwr, fitness_trend, calories, steps, drivers FROM daily WHERE user_id = ? AND date = ?',
+    'SELECT acwr, fitness_trend, calories, steps, drivers, vo2max, fitness, fatigue, form, monotony FROM daily WHERE user_id = ? AND date = ?',
   ).bind(c.get('userId'), date).first<any>()
   const acwr = dr?.acwr ?? null
   const band = acwr == null ? null
@@ -97,6 +97,11 @@ export async function getDayStrain(c: Ctx) {
     // Training load (ACWR band) + fitness trend + day energy/steps.
     load: acwr == null ? null : { acwr: Math.round(acwr * 100) / 100, band },
     fitness_trend: dr?.fitness_trend ?? null,
+    // Banister fitness/fatigue/form + VO₂max + Foster monotony (the Body fitness model).
+    vo2max: dr?.vo2max ?? null,
+    fitness_model: (dr?.fitness != null || dr?.fatigue != null || dr?.form != null)
+      ? { fitness: dr?.fitness ?? null, fatigue: dr?.fatigue ?? null, form: dr?.form ?? null } : null,
+    monotony: dr?.monotony ?? null,
     calories: dr?.calories ?? null,
     steps: dr?.steps ?? null,
     drivers: dr?.drivers ? safe(dr.drivers) : null,
@@ -110,6 +115,69 @@ export async function getDayStrain(c: Ctx) {
 const strainScale = (trimp: number) => Math.min(21, Math.log(trimp + 1) / Math.log(1.5))
 const round1 = (n: number) => Math.round(n * 10) / 10
 const safe = (s: any) => { try { return JSON.parse(s) } catch { return null } }
+
+// ── /day/wear ──────────────────────────────────────────────────────────────
+// How long the strap was actually on the wrist for a day, plus when. Built from
+// the minute table's per-minute wrist_on flag (the source of truth for wear_min).
+// Returns total worn minutes, coverage %, a 24-bin hourly coverage histogram,
+// first-on / last-off timestamps, the number of separate wear stretches, and the
+// longest off-wrist gap inside the worn window. UTC day, JWT-scoped.
+export async function getDayWear(c: Ctx) {
+  const date = (c.req.query('date') || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const start = dayStartOf(date)
+  const mins = await loadMinutes(c, start, start + DAY)
+
+  // 24 hourly bins of minutes-worn (0..60). Index by the minute's hour-of-day.
+  const hourly = Array.from({ length: 24 }, () => 0)
+  let wornMin = 0
+  let firstOn: number | null = null
+  let lastOn: number | null = null
+  let segments = 0
+  let prevWorn = false
+  // Gap tracking: longest run of not-worn minutes BETWEEN the first and last worn minute.
+  let longestGap = 0
+  for (const m of mins) {
+    const worn = !!m.wrist_on
+    const hour = Math.floor(((m.ts_min - start) % DAY) / 3600)
+    if (worn) {
+      wornMin++
+      if (hour >= 0 && hour < 24) hourly[hour]++
+      if (firstOn == null) firstOn = m.ts_min
+      lastOn = m.ts_min
+      if (!prevWorn) segments++
+    }
+    prevWorn = worn
+  }
+  // Longest off-wrist gap inside [firstOn, lastOn] (minutes the band wasn't on).
+  if (firstOn != null && lastOn != null) {
+    const wornSet = new Set(mins.filter((m) => m.wrist_on).map((m) => m.ts_min))
+    let gap = 0
+    for (let t = firstOn; t <= lastOn; t += 60) {
+      if (wornSet.has(t)) { if (gap > longestGap) longestGap = gap; gap = 0 }
+      else gap++
+    }
+    if (gap > longestGap) longestGap = gap
+  }
+
+  // Prefer the derived daily.wear_min when present (same source), else the live count.
+  const dr = await c.env.DB.prepare(
+    'SELECT wear_min FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(c.get('userId'), date).first<{ wear_min: number | null }>()
+  const wearMin = dr?.wear_min != null ? Math.round(dr.wear_min) : wornMin
+
+  return c.json({
+    date,
+    worn_min: wearMin,
+    coverage_pct: Math.round((wearMin / 1440) * 100),
+    hourly,                                   // [24] minutes worn per hour (0..60)
+    first_on: firstOn,                        // unix sec of first worn minute (null = never on)
+    last_on: lastOn,                          // unix sec of last worn minute
+    segments,                                 // number of separate on-wrist stretches
+    longest_off_min: longestGap,              // longest off-wrist gap inside the worn window
+    tier: 'AUTH',                             // straight from the device's wrist sensor
+  })
+}
 
 // ── /day/sleep ───────────────────────────────────────────────────────────────
 export async function getDaySleep(c: Ctx) {
@@ -239,7 +307,7 @@ export async function getDayTimeline(c: Ctx) {
     'SELECT onset_ts, wake_ts, duration_min FROM sleep WHERE user_id = ? AND wake_ts >= ? AND onset_ts < ?',
   ).bind(c.get('userId'), start - DAY, end).all<any>()
   const { results: sessions } = await c.env.DB.prepare(
-    'SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? ORDER BY start_ts ASC',
+    "SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND status != 'deleted' ORDER BY start_ts ASC",
   ).bind(c.get('userId'), start, end).all<any>()
   const { results: events } = await c.env.DB.prepare(
     'SELECT event_id, ts FROM events WHERE user_id = ? AND ts >= ? AND ts < ? ORDER BY ts ASC',
@@ -271,7 +339,7 @@ export async function getDayHeart(c: Ctx) {
   const mins = await loadMinutes(c, start, start + DAY)
   const userId = c.get('userId')
   const d = await c.env.DB.prepare(
-    'SELECT resting_hr, recovery, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hr_zones, nocturnal, stress, illness, drivers, resp_rate, resp_conf, spo2_idx FROM daily WHERE user_id = ? AND date = ?',
+    'SELECT resting_hr, recovery, readiness, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hrv_cv, irregular, hr_zones, nocturnal, stress, illness, drivers, resp_rate, resp_conf, spo2_idx FROM daily WHERE user_id = ? AND date = ?',
   ).bind(userId, date).first<any>()
   const base = await c.env.DB.prepare('SELECT resting_hr, hrv_rmssd FROM baselines WHERE user_id = ?')
     .bind(userId).first<any>()
@@ -286,13 +354,15 @@ export async function getDayHeart(c: Ctx) {
     resting_hr: d?.resting_hr ?? null,
     resting_hr_baseline: base?.resting_hr ?? null,
     recovery: d?.recovery ?? null,
+    readiness: d?.readiness ?? null,
     hrv: d?.hrv_rmssd != null
-      ? { rmssd: d.hrv_rmssd, sdnn: d.hrv_sdnn, lf_hf: d.hrv_lfhf, confidence: d.hrv_conf, baseline: base?.hrv_rmssd ?? null }
+      ? { rmssd: d.hrv_rmssd, sdnn: d.hrv_sdnn, lf_hf: d.hrv_lfhf, cv: d.hrv_cv ?? null, confidence: d.hrv_conf, baseline: base?.hrv_rmssd ?? null }
       : null,
     zones: d?.hr_zones ? parse(d.hr_zones) : null,
     nocturnal: parse(d?.nocturnal ?? null),
     stress: parse(d?.stress ?? null),
     illness: parse(d?.illness ?? null),
+    irregular: parse(d?.irregular ?? null),
     // Respiratory rate (RSA, gated) + relative SpO₂ now live under Heart.
     resp: (d?.resp_rate != null && (d?.resp_conf ?? 0) >= 0.3)
       ? { value: d.resp_rate, confidence: d.resp_conf } : null,

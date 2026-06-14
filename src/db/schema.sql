@@ -86,6 +86,14 @@ CREATE TABLE IF NOT EXISTS daily(
   sleep_stress TEXT,                   -- nocturnal arousal / sleep-stress (JSON, with drivers)
   drivers TEXT,                        -- per-metric driver graph for the day (JSON)
   skin_temp_idx REAL, spo2_idx REAL,   -- RELATIVE: raw ADC night value − personal baseline
+  vo2max REAL,                         -- VO₂max estimate (Uth–Sørensen, ESTIMATE)
+  fitness REAL, fatigue REAL, form REAL,  -- Banister CTL / ATL / TSB from daily strain
+  monotony REAL,                       -- Foster training monotony (7d mean/SD strain)
+  hrv_cv REAL,                         -- coefficient of variation of nightly RMSSD (%)
+  nocturnal_dip_pct REAL,              -- nocturnal HR dip (fraction) — trendable copy
+  irregular TEXT,                      -- irregular-rhythm SCREEN (JSON, Poincaré) — not a diagnosis
+  -- NOTE: `readiness` (above) is REPURPOSED for the composite Readiness index
+  -- (HRV ∩ sleep ∩ dip ∩ arousal), written by biometrics.ts.
   confidence REAL, flags TEXT, updated_at INTEGER,
   PRIMARY KEY(user_id, date)
 );

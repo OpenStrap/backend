@@ -9,6 +9,7 @@
 import {
   calcRestingHR, calcStrain, calcHrZones, calcCalories, calcSleep,
   calcSleepRegularity, detectSessions, calcLoad, calcFitnessTrend,
+  calcVo2Max, calcFitnessModel, calcMonotony,
   calcAnomaly, calcBaselines, buildCoach,
   calcSleepStress, calcNocturnalHeart, buildNotifications,
   type Minute, type Profile, type Baseline, type DayHistory,
@@ -255,9 +256,11 @@ export async function processUser(
     hrrSeries.push(dayHrr)
 
     // Only clear AUTO-detected sessions — manually-started / live workouts are
-    // user-owned and must survive a re-derive.
+    // user-owned and must survive a re-derive. Deleted tombstones are KEPT so a
+    // user-deleted auto session isn't resurrected (its row's status stays
+    // 'deleted'; the re-insert below only updates non-status fields via ON CONFLICT).
     statements.push(
-      db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto')")
+      db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND status != 'deleted'")
         .bind(userId, dayStart, dayStart + DAY),
     )
     for (const s of sessions) {
@@ -358,6 +361,17 @@ export async function processUser(
     // this day (may be null until RR is processed) — the coach degrades gracefully.
     const recovery = recoveryByDate.get(date) ?? null
 
+    // ── Fitness modeling (published, from data we already have; no recovery dep) ──
+    // VO₂max (Uth–Sørensen) — only with a MEASURED max HR; abstains otherwise.
+    const vo2 = calcVo2Max(baseline.max_hr && baseline.max_hr > 0 ? baseline.max_hr : null,
+      rhr.resting_hr ?? baseline.resting_hr ?? null)
+    // Banister fitness/fatigue/form + Foster monotony from the trailing strain.
+    const fitModel = calcFitnessModel(loadStrains)
+    const monotony = calcMonotony(loadStrains)
+    // Nocturnal HR dip % (persisted as a column so it's trendable). Composite
+    // Readiness + HRV CV/irregular are owned by biometrics.ts (HRV is fresh there).
+    const nocDip = (() => { try { return JSON.parse(nocturnal)?.dip_pct ?? null } catch { return null } })()
+
     const anomaly = calcAnomaly({
       recent_rhr: recentRhr,
       skin_temp: baseline.skin_temp ?? null,
@@ -447,18 +461,21 @@ export async function processUser(
     // It writes `drivers` (main metrics) via COALESCE-free set but biometrics
     // read-merges, and on the hourly path (no biometrics) main drivers stand alone.
     statements.push(db.prepare(
-      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, steps, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, confidence, flags, updated_at) ' +
-      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
+      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, steps, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, vo2max, fitness, fatigue, form, monotony, nocturnal_dip_pct, confidence, flags, updated_at) ' +
+      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
       'strain=excluded.strain, resting_hr=excluded.resting_hr, ' +
       'calories=excluded.calories, wear_min=excluded.wear_min, steps=excluded.steps, hr_zones=excluded.hr_zones, ' +
       'acwr=excluded.acwr, fitness_trend=excluded.fitness_trend, anomaly=excluded.anomaly, coach=excluded.coach, ' +
       'nocturnal=excluded.nocturnal, sleep_stress=excluded.sleep_stress, ' +
       'drivers=json_patch(COALESCE(daily.drivers,\'{}\'), excluded.drivers), ' +
+      'vo2max=excluded.vo2max, fitness=excluded.fitness, fatigue=excluded.fatigue, form=excluded.form, ' +
+      'monotony=excluded.monotony, nocturnal_dip_pct=excluded.nocturnal_dip_pct, ' +
       'confidence=excluded.confidence, flags=excluded.flags, updated_at=excluded.updated_at',
     ).bind(userId, date, strain.score, rhr.resting_hr == null ? null : Math.round(rhr.resting_hr),
       calories.kcal,
       wearMin, steps, JSON.stringify(zones), load.acwr, fitness.direction,
       bodyAlert, JSON.stringify(coach), nocturnal, sleepStress, driversJson,
+      vo2.vo2max, fitModel.fitness, fitModel.fatigue, fitModel.form, monotony.monotony, nocDip,
       confidence, flags, now))
     dailyN++
 
