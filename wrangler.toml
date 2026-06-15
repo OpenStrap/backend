@@ -12,28 +12,29 @@ database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 binding = "RAW_BUCKET"
 bucket_name = "openstrap-raw"
 
-# Analytics queue (producer + consumer). DISABLED on this account: Cloudflare
-# Queues require the Workers Paid plan, which isn't enabled here (queue create
-# returns "specified queue settings are invalid"). The code path is fully
-# preserved — ingest.ts falls back to setting analytics_cursor.dirty=1 and the
-# hourly cron ("7 * * * *") + /admin/run-analytics process the work. To enable:
-# upgrade to Workers Paid, `wrangler queues create openstrap-analytics` +
-# `... -dlq`, then uncomment these blocks. The queue() consumer export in
-# index.ts is harmless to keep exported while the binding is absent.
-# [[queues.producers]]
-# binding = "ANALYTICS_Q"
-# queue = "openstrap-analytics"
-#
-# [[queues.consumers]]
-# queue = "openstrap-analytics"
-# max_batch_size = 20
-# max_batch_timeout = 30
-# max_retries = 3
-# dead_letter_queue = "openstrap-analytics-dlq"
+# Analytics queue (producer + consumer). ENABLED on Workers Paid. The cron just
+# ENQUEUES one (user, job) message per unit of work; the consumer processes one
+# bounded unit per invocation, so heavy R2 jobs (biometrics/resp/steps) never hit
+# the 1000-subrequest per-invocation cap. ingest.ts also enqueues a 'sweep' on
+# upload (falls back to analytics_cursor.dirty=1 if the binding is absent).
+# max_batch_size = 1 → exactly one (user, job) per invocation (guaranteed bounded).
+[[queues.producers]]
+binding = "ANALYTICS_Q"
+queue = "openstrap-analytics"
 
-# Crons: hourly safety sweep (enqueue dirty users) + nightly re-derive/prune.
+[[queues.consumers]]
+queue = "openstrap-analytics"
+max_batch_size = 1
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "openstrap-analytics-dlq"
+
+# Crons: 30-min sweep (re-derive dirty users → keeps "today" fresh; pure-read
+# endpoints serve this snapshot) + nightly full re-derive/prune. Any non-nightly
+# cron string falls through to the sweep branch in scheduled(); only "30 3 * * *"
+# triggers the nightly path. (Future: tighten the sweep to */15 if needed.)
 [triggers]
-crons = ["7 * * * *", "30 3 * * *"]
+crons = ["*/30 * * * *", "30 3 * * *"]
 
 [vars]
 EMAIL_FROM_NAME = "OpenStrap"

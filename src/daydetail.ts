@@ -44,56 +44,40 @@ function downsample<T>(arr: T[], cap = 300): T[] {
 }
 
 // ── /day/strain ──────────────────────────────────────────────────────────────
+// PURE READ: serve the snapshot the analytics cron precomputed (daily row +
+// sessions). No live recompute on the endpoint — strain, curve, zones and HR
+// stats all come from `daily`, so /day/strain can never diverge from /today and
+// the read is fast. Freshness is the cron's job (ingest → dirty → cron).
 export async function getDayStrain(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
   const start = dayStartOf(date)
-  const mins = await loadMinutes(c, start, start + DAY)
-  const { rhr, maxHr } = await loadHr(c)
-  const denom = Math.max(1, maxHr - rhr)
 
-  let trimp = 0
-  const curve: { t: number; v: number }[] = []
-  const zones = [0, 0, 0, 0, 0]
-  let hrMax = 0, hrMinNonZero = 0, hrSum = 0, hrN = 0
-  for (const m of mins) {
-    const hr = m.hr_avg ?? 0
-    if (hr <= 0) { curve.push({ t: m.ts_min, v: round1(strainScale(trimp)) }); continue }
-    const ratio = clamp((hr - rhr) / denom, 0, 1)
-    trimp += ratio * 0.64 * Math.exp(1.92 * ratio)
-    curve.push({ t: m.ts_min, v: round1(strainScale(trimp)) })
-    const pct = (hr / maxHr) * 100
-    if (pct >= 90) zones[4]++
-    else if (pct >= 80) zones[3]++
-    else if (pct >= 70) zones[2]++
-    else if (pct >= 60) zones[1]++
-    else if (pct >= 50) zones[0]++
-    hrMax = Math.max(hrMax, hr)
-    hrMinNonZero = hrMinNonZero === 0 ? hr : Math.min(hrMinNonZero, hr)
-    hrSum += hr; hrN++
-  }
+  const dr = await c.env.DB.prepare(
+    'SELECT strain, hr_zones, wear_min, strain_curve, hr_max, hr_min, hr_avg, acwr, fitness_trend, ' +
+    'calories, steps, drivers, vo2max, fitness, fatigue, form, monotony FROM daily WHERE user_id = ? AND date = ?',
+  ).bind(c.get('userId'), date).first<any>()
+
+  const z = dr?.hr_zones ? safe(dr.hr_zones) : null
+  const acwr = dr?.acwr ?? null
+  const band = acwr == null ? null
+    : acwr < 0.8 ? 'detraining' : acwr <= 1.3 ? 'optimal' : acwr <= 1.5 ? 'caution' : 'high-risk'
 
   const { results: sessions } = await c.env.DB.prepare(
     'SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones FROM sessions ' +
     "WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND status != 'deleted' ORDER BY start_ts ASC",
   ).bind(c.get('userId'), start, start + DAY).all<any>()
 
-  // Training-load + day totals from the derived `daily` row (acwr/fitness/cals/steps + drivers).
-  const dr = await c.env.DB.prepare(
-    'SELECT acwr, fitness_trend, calories, steps, drivers, vo2max, fitness, fatigue, form, monotony FROM daily WHERE user_id = ? AND date = ?',
-  ).bind(c.get('userId'), date).first<any>()
-  const acwr = dr?.acwr ?? null
-  const band = acwr == null ? null
-    : acwr < 0.8 ? 'detraining' : acwr <= 1.3 ? 'optimal' : acwr <= 1.5 ? 'caution' : 'high-risk'
-
   return c.json({
     date,
-    strain: round1(strainScale(trimp)),
-    curve: downsample(curve),
-    zones: { z1: zones[0], z2: zones[1], z3: zones[2], z4: zones[3], z5: zones[4] },
-    hr: { max: hrMax || null, min: hrMinNonZero || null, avg: hrN ? Math.round(hrSum / hrN) : null },
-    max_hr_used: maxHr,
-    worn_min: mins.filter((m) => m.wrist_on).length,
+    strain: dr?.strain ?? 0,
+    curve: dr?.strain_curve ? safe(dr.strain_curve) : [],
+    zones: z
+      ? { z1: z.zone1_min ?? 0, z2: z.zone2_min ?? 0, z3: z.zone3_min ?? 0, z4: z.zone4_min ?? 0, z5: z.zone5_min ?? 0 }
+      : { z1: 0, z2: 0, z3: 0, z4: 0, z5: 0 },
+    hr: { max: dr?.hr_max ?? null, min: dr?.hr_min ?? null, avg: dr?.hr_avg ?? null },
+    max_hr_used: z?.max_hr_used ?? null,
+    worn_min: dr?.wear_min ?? 0,
     // Training load (ACWR band) + fitness trend + day energy/steps.
     load: acwr == null ? null : { acwr: Math.round(acwr * 100) / 100, band },
     fitness_trend: dr?.fitness_trend ?? null,
@@ -180,6 +164,40 @@ export async function getDayWear(c: Ctx) {
 }
 
 // ── /day/sleep ───────────────────────────────────────────────────────────────
+// GET /day/v2/sleep?date= — every sleep period for the date (one card each;
+// naps = shorter sleeps). Additive companion to GET /day/sleep (single-period).
+export async function getDaySleepV2(c: Ctx) {
+  const date = (c.req.query('date') || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId')
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM sleep_periods WHERE user_id = ? AND date = ? ORDER BY onset_ts ASC',
+  ).bind(userId, date).all<any>()
+  const baseline = await c.env.DB.prepare('SELECT sleep_need_min FROM baselines WHERE user_id = ?')
+    .bind(userId).first<any>()
+  const need = (baseline?.sleep_need_min && baseline.sleep_need_min >= 180) ? baseline.sleep_need_min : 480
+  const periods = (results ?? []).map((r: any) => ({
+    id: r.id,
+    onset_ts: r.onset_ts,
+    wake_ts: r.wake_ts,
+    duration_min: r.duration_min,
+    in_bed_min: r.in_bed_min,
+    efficiency: r.efficiency,
+    stages: (r.light_min != null || r.deep_min != null || r.rem_min != null)
+      ? { light_min: r.light_min, deep_min: r.deep_min, rem_min: r.rem_min } : null,
+    is_main: !!r.is_main,
+    confidence: r.confidence,
+  }))
+  return c.json({
+    date,
+    has_sleep: periods.length > 0,
+    need_min: need,
+    total_asleep_min: periods.reduce((a: number, p: any) => a + (p.duration_min || 0), 0),
+    periods,
+    stages_beta: true,
+  })
+}
+
 export async function getDaySleep(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
