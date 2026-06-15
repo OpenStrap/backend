@@ -4,18 +4,18 @@ import {
 } from './auth'
 import { runAnalytics, processUser } from './analytics'
 import { ingestBatch, ingestEvents } from './ingest'
-import { handleQueueBatch, type AnalyticsMessage } from './queue'
-import { getToday, getSleep, getStrain, getSessions, getTrends, getChart } from './query'
+import { handleQueueBatch, type AnalyticsMessage, type AnalyticsJob } from './queue'
+import { getToday, getSleep, getSleepV2, getStrain, getSessions, getTrends, getChart } from './query'
 import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
-import { getDayStrain, getDaySleep, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
+import { getDayStrain, getDaySleep, getDaySleepV2, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
 import { getTrend } from './trend'
+import { runStepsImu, runStepsIncremental } from './steps_imu'
 import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts } from './workouts'
 import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { runRespRate } from './resp'
 import { runBiometrics } from './biometrics'
-import { runStepsImu } from './steps_imu'
 import { getAppStatus, adminGetConfig, adminSetConfig } from './appconfig'
 import { seedInit, seedMinutes, seedAnalytics } from './seed'
 
@@ -39,6 +39,11 @@ const REFRESH_TTL = 30 * 24 * 60 * 60    // 30d
 const OTP_TTL = 10 * 60                   // 10m
 const OTP_MAX_ATTEMPTS = 5
 const DAY = 86400
+// Per-minute rollups are kept this long. The app shows minute-level detail
+// (hypnogram, 24h timelines, wear, workout HR curve) for the last 7 days; this +3
+// buffer avoids a boundary race at the edge of that window. Derived metrics
+// (daily/sleep/sessions) are permanent — pruning minutes never affects them.
+const MINUTE_RETENTION_DAYS = 10
 
 const app = new Hono<{ Bindings: Bindings; Variables: Vars }>()
 
@@ -64,6 +69,7 @@ app.use('/ingest/*', requireJwt)
 app.use('/profile', requireJwt)
 app.use('/today', requireJwt)
 app.use('/sleep', requireJwt)
+app.use('/sleep/v2', requireJwt)
 app.use('/strain', requireJwt)
 app.use('/sessions', requireJwt)
 app.use('/trends', requireJwt)
@@ -191,22 +197,25 @@ app.post('/auth/refresh', async (c) => {
 
 app.get('/profile', async (c) => {
   const user = await c.env.DB.prepare(
-    'SELECT id, email, name, age, height_cm, weight_kg, sex, created_at FROM users WHERE id = ?',
+    'SELECT id, email, name, age, height_cm, weight_kg, sex, step_goal, created_at FROM users WHERE id = ?',
   ).bind(c.get('userId')).first()
   if (!user) return c.json({ error: 'Not found' }, 404)
   return c.json(user)
 })
 
 app.patch('/profile', async (c) => {
-  const { name, age, height_cm, weight_kg, sex } =
-    await c.req.json<{ name?: string; age?: number; height_cm?: number; weight_kg?: number; sex?: string }>()
+  const { name, age, height_cm, weight_kg, sex, step_goal } =
+    await c.req.json<{ name?: string; age?: number; height_cm?: number; weight_kg?: number; sex?: string; step_goal?: number }>()
   const sexVal = sex === 'm' || sex === 'f' ? sex : null
+  // step_goal: clamp to a sane range when provided; null leaves it unchanged.
+  const goalVal = (typeof step_goal === 'number' && isFinite(step_goal))
+    ? Math.max(1000, Math.min(50000, Math.round(step_goal))) : null
   await c.env.DB.prepare(
     'UPDATE users SET name=COALESCE(?,name), age=COALESCE(?,age), height_cm=COALESCE(?,height_cm), ' +
-    'weight_kg=COALESCE(?,weight_kg), sex=COALESCE(?,sex) WHERE id = ?',
-  ).bind(name ?? null, age ?? null, height_cm ?? null, weight_kg ?? null, sexVal, c.get('userId')).run()
+    'weight_kg=COALESCE(?,weight_kg), sex=COALESCE(?,sex), step_goal=COALESCE(?,step_goal) WHERE id = ?',
+  ).bind(name ?? null, age ?? null, height_cm ?? null, weight_kg ?? null, sexVal, goalVal, c.get('userId')).run()
   const user = await c.env.DB.prepare(
-    'SELECT id, email, name, age, height_cm, weight_kg, sex, created_at FROM users WHERE id = ?',
+    'SELECT id, email, name, age, height_cm, weight_kg, sex, step_goal, created_at FROM users WHERE id = ?',
   ).bind(c.get('userId')).first()
   return c.json(user)
 })
@@ -218,6 +227,7 @@ app.post('/ingest/events', ingestEvents)
 // ========================= QUERY =========================
 app.get('/today', getToday)
 app.get('/sleep', getSleep)
+app.get('/sleep/v2', getSleepV2)
 app.get('/strain', getStrain)
 app.get('/sessions', getSessions)
 app.get('/trends', getTrends)
@@ -228,6 +238,7 @@ app.get('/journal', getJournal)
 app.get('/journal/insights', getJournalInsights)
 app.get('/day/strain', getDayStrain)
 app.get('/day/sleep', getDaySleep)
+app.get('/day/v2/sleep', getDaySleepV2)
 app.get('/day/timeline', getDayTimeline)
 app.get('/day/stress', getDayStress)
 app.get('/day/heart', getDayHeart)
@@ -249,21 +260,30 @@ app.post('/notifications/read', markNotificationsRead)
 app.get('/admin/config', adminGetConfig)
 app.post('/admin/config', adminSetConfig)
 
+// Raw R2 objects auto-expire after this many days (bucket lifecycle rule
+// `expire-raw-14d`). The R2-re-decode jobs (HRV/resp/IMU steps) can therefore
+// only run over data this recent — older raw is gone, so we cap their `days`
+// here. Keep this in sync with the R2 lifecycle rule.
+const RAW_RETENTION_DAYS = 14
+
 app.post('/admin/run-analytics', async (c) => {
   const body = await c.req.json<{ user_id?: string; days?: number; bio?: boolean }>().catch(() => ({} as any))
   const days = body.days ?? 3
+  // Biometrics re-decodes from R2 → can only go back as far as raw is retained.
+  const bioDays = Math.min(days, RAW_RETENTION_DAYS)
   if (body.user_id) {
     // Full re-derive sequence so HRV recovery feeds the coach:
     //   1. processUser  — minute metrics (strain/RHR/sleep/sessions...) + daily rows
-    //   2. runBiometrics — HRV recovery/stress/illness from RR (needs daily RHR)
+    //      (reads the `minute` table, retained 90d — not R2 — so `days` is unbounded here)
+    //   2. runBiometrics — HRV recovery/stress/illness from RR (R2; capped to retention)
     //   3. processUser  — coach picks up the recovery written in step 2
     const r1 = await processUser(c.env.DB, body.user_id, { historyDays: days })
     let bio: any = null
     if (body.bio !== false) {
-      bio = await runBiometrics(c.env, body.user_id, days)
+      bio = await runBiometrics(c.env, body.user_id, bioDays)
       await processUser(c.env.DB, body.user_id, { historyDays: days })
     }
-    return c.json({ ok: true, ...r1, bio })
+    return c.json({ ok: true, ...r1, bio, bio_days: bioDays, bio_capped: bioDays < days })
   }
   const res = await runAnalytics(c.env.DB, { historyDays: days })
   return c.json({ ok: true, ...res })
@@ -271,20 +291,42 @@ app.post('/admin/run-analytics', async (c) => {
 
 // Respiratory rate from PPG (R21 re-decoded from R2). Heavy (R2 reads) → admin /
 // cron only. Stores resp_rate/resp_conf on daily; gated (conf ≥ 0.5) before surfaced.
+// `days` is capped to the R2 retention window (older raw no longer exists).
 app.post('/admin/run-resp', async (c) => {
   const body = await c.req.json<{ user_id: string; days?: number }>().catch(() => ({} as any))
   if (!body.user_id) return c.json({ error: 'user_id required' }, 400)
-  const res = await runRespRate(c.env, body.user_id, body.days ?? 3)
-  return c.json({ ok: true, ...res })
+  const reqDays = body.days ?? 3
+  const days = Math.min(reqDays, RAW_RETENTION_DAYS)
+  const res = await runRespRate(c.env, body.user_id, days)
+  return c.json({ ok: true, ...res, capped: days < reqDays, max_days: RAW_RETENTION_DAYS })
 })
 
 // HRV (RMSSD) + relative skin-temp / SpO₂ from the V24 RR/ADC bytes, re-decoded
 // from R2. Heavy (R2 reads) → admin / cron only. Writes daily.hrv_rmssd etc.
+// `days` is capped to the R2 retention window (older raw no longer exists).
 app.post('/admin/run-biometrics', async (c) => {
   const body = await c.req.json<{ user_id: string; days?: number }>().catch(() => ({} as any))
   if (!body.user_id) return c.json({ error: 'user_id required' }, 400)
-  const res = await runBiometrics(c.env, body.user_id, body.days ?? 3)
-  return c.json({ ok: true, ...res })
+  const reqDays = body.days ?? 3
+  const days = Math.min(reqDays, RAW_RETENTION_DAYS)
+  const res = await runBiometrics(c.env, body.user_id, days)
+  return c.json({ ok: true, ...res, capped: days < reqDays, max_days: RAW_RETENTION_DAYS })
+})
+
+// Steps from the wrist IMU (AN-2554 over raw R2). mode=incremental (default) counts
+// only newly-settled minutes since the cursor; mode=full recomputes the last `days`
+// (capped to R2 retention) and realigns the cursor. Heavy (R2) → admin / cron only.
+app.post('/admin/run-steps', async (c) => {
+  const body = await c.req.json<{ user_id: string; mode?: 'incremental' | 'full'; days?: number }>().catch(() => ({} as any))
+  if (!body.user_id) return c.json({ error: 'user_id required' }, 400)
+  if (body.mode === 'full') {
+    const reqDays = body.days ?? 1
+    const days = Math.min(reqDays, RAW_RETENTION_DAYS)
+    const res = await runStepsImu(c.env, body.user_id, days)
+    return c.json({ ok: true, mode: 'full', ...res, capped: days < reqDays })
+  }
+  const res = await runStepsIncremental(c.env, body.user_id)
+  return c.json({ ok: true, mode: 'incremental', ...res })
 })
 
 // Phased to stay under the free-plan per-request subrequest cap. The shell
@@ -338,6 +380,17 @@ app.post('/admin/issue-token', async (c) => {
   return c.json({ access_jwt: access, refresh_token: refresh, user_id: user.id })
 })
 
+// Enqueue an analytics job for a user (ops + verification). The consumer runs it
+// in its own bounded invocation. 404 if Queues isn't bound.
+app.post('/admin/enqueue', async (c) => {
+  const body = await c.req.json<{ user_id: string; job?: AnalyticsJob; day?: string }>().catch(() => ({} as any))
+  if (!body.user_id) return c.json({ error: 'user_id required' }, 400)
+  if (!c.env.ANALYTICS_Q) return c.json({ error: 'queue not bound' }, 404)
+  const msg = { user_id: body.user_id, job: body.job ?? 'sweep', ...(body.day ? { day: body.day } : {}) }
+  await c.env.ANALYTICS_Q.send(msg)
+  return c.json({ ok: true, enqueued: msg })
+})
+
 app.post('/admin/wipe-raw', async (c) => {
   let deleted = 0
   let cursor: string | undefined
@@ -355,68 +408,105 @@ app.post('/admin/wipe-raw', async (c) => {
 
 // Prune minute rows older than 90 days (raw stays in R2).
 app.post('/admin/prune', async (c) => {
-  const cutoff = Math.floor(Date.now() / 1000) - 90 * DAY
+  const cutoff = Math.floor(Date.now() / 1000) - MINUTE_RETENTION_DAYS * DAY
   const res = await c.env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
   return c.json({ ok: true, deleted: res.meta?.changes ?? 0, cutoff })
 })
 
+// Send messages in sendBatch chunks of 100 (the Queues per-call max), so the cron
+// itself never blows its own subrequest budget no matter how many users.
+async function sendChunked(q: Queue<AnalyticsMessage>, msgs: { body: AnalyticsMessage }[]): Promise<void> {
+  for (let i = 0; i < msgs.length; i += 100) {
+    await q.sendBatch(msgs.slice(i, i + 100))
+  }
+}
+
+// One (user, job) message per user (day-less — for 'sweep').
+async function enqueueJobs(q: Queue<AnalyticsMessage>, userIds: string[], job: AnalyticsJob): Promise<void> {
+  await sendChunked(q, userIds.map((user_id) => ({ body: { user_id, job } })))
+}
+
+// One (user, job, day) message per user × day — heavy R2 jobs fanned out so each
+// consumer invocation processes exactly ONE bounded day (works for any user, no
+// matter how much they wore the band).
+async function enqueueJobDays(q: Queue<AnalyticsMessage>, userIds: string[], job: AnalyticsJob, dates: string[]): Promise<void> {
+  const msgs: { body: AnalyticsMessage }[] = []
+  for (const user_id of userIds) for (const day of dates) msgs.push({ body: { user_id, job, day } })
+  await sendChunked(q, msgs)
+}
+
+// The last `n` UTC dates (today first) as YYYY-MM-DD.
+function lastNDates(n: number): string[] {
+  const now = Math.floor(Date.now() / 1000)
+  return Array.from({ length: n }, (_, d) => new Date((Math.floor((now - d * DAY) / DAY) * DAY) * 1000).toISOString().slice(0, 10))
+}
+
 export default {
   fetch: app.fetch,
 
-  // Queue consumer (no-op if Queues disabled / binding absent — export is safe).
+  // Queue consumer — one bounded (user, job) unit per invocation.
   async queue(batch: MessageBatch<AnalyticsMessage>, env: Bindings): Promise<void> {
     await handleQueueBatch(batch, env)
   },
 
-  // Crons: "7 * * * *" hourly safety sweep; "30 3 * * *" nightly re-derive+prune.
+  // Crons: "*/30 * * * *" sweep (enqueue dirty users); "30 3 * * *" nightly full
+  // re-derive + R2 jobs + prune. With Queues bound, the cron only ENQUEUES; the
+  // consumer does the bounded per-user work. Inline fallback if the binding is absent.
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext): Promise<void> {
     if (event.cron === '30 3 * * *') {
       ctx.waitUntil((async () => {
-        // Full re-derive yesterday for all users that have any minute data, then prune.
-        await runAnalytics(env.DB, { historyDays: 2 })
-        // Respiratory rate from PPG for users with a recent sleep row (R2 re-decode;
-        // null on nights without live PPG — gate handles it). Bounded per night.
-        try {
-          const since = new Date(Date.now() - 2 * DAY * 1000).toISOString().slice(0, 10)
-          const { results: users } = await env.DB.prepare(
-            'SELECT DISTINCT user_id FROM sleep WHERE date >= ? AND onset_ts IS NOT NULL',
-          ).bind(since).all<{ user_id: string }>()
-          for (const u of users ?? []) await runRespRate(env, u.user_id, 2)
-        } catch (e) { console.error('resp cron failed', e) }
-        // HRV + relative skin-temp/SpO₂ from the V24 RR/ADC bytes (R2 re-decode).
-        try {
-          const since = new Date(Date.now() - 3 * DAY * 1000).toISOString().slice(0, 10)
-          const { results: users } = await env.DB.prepare(
-            'SELECT DISTINCT user_id FROM daily WHERE date >= ?',
-          ).bind(since).all<{ user_id: string }>()
-          for (const u of users ?? []) await runBiometrics(env, u.user_id, 3)
-        } catch (e) { console.error('biometrics cron failed', e) }
-        // Steps from the wrist IMU (R10 + 0x33 re-decode → AN-2554 pedometer).
-        try {
-          const since = new Date(Date.now() - 2 * DAY * 1000).toISOString().slice(0, 10)
-          const { results: users } = await env.DB.prepare(
-            'SELECT DISTINCT user_id FROM daily WHERE date >= ?',
-          ).bind(since).all<{ user_id: string }>()
-          for (const u of users ?? []) await runStepsImu(env, u.user_id, 2)
-        } catch (e) { console.error('steps cron failed', e) }
-        const cutoff = Math.floor(Date.now() / 1000) - 90 * DAY
+        const since2 = new Date(Date.now() - 2 * DAY * 1000).toISOString().slice(0, 10)
+        const since3 = new Date(Date.now() - 3 * DAY * 1000).toISOString().slice(0, 10)
+        if (env.ANALYTICS_Q) {
+          // Fan out per (user, job): each consumer invocation = one bounded unit.
+          const dailyU = (await env.DB.prepare('SELECT DISTINCT user_id FROM daily WHERE date >= ?')
+            .bind(since3).all<{ user_id: string }>()).results ?? []
+          const sleepU = (await env.DB.prepare('SELECT DISTINCT user_id FROM sleep WHERE date >= ? AND onset_ts IS NOT NULL')
+            .bind(since2).all<{ user_id: string }>()).results ?? []
+          const ids = dailyU.map((u) => u.user_id)
+          // 'sweep' = one per user (D1 + incremental steps, light). Heavy R2 jobs
+          // fan out per (user, day) so each unit reads ≤ one day — bounded for ANY user.
+          await enqueueJobs(env.ANALYTICS_Q, ids, 'sweep')
+          await enqueueJobDays(env.ANALYTICS_Q, ids, 'biometrics', lastNDates(3))
+          await enqueueJobDays(env.ANALYTICS_Q, ids, 'steps_full', lastNDates(2))
+          await enqueueJobDays(env.ANALYTICS_Q, sleepU.map((u) => u.user_id), 'resp', lastNDates(2))
+        } else {
+          // Fallback (no queue): inline. Only viable at small scale.
+          await runAnalytics(env.DB, { historyDays: 2 })
+          try {
+            const u = (await env.DB.prepare('SELECT DISTINCT user_id FROM sleep WHERE date >= ? AND onset_ts IS NOT NULL').bind(since2).all<{ user_id: string }>()).results ?? []
+            for (const x of u) await runRespRate(env, x.user_id, 2)
+          } catch (e) { console.error('resp cron failed', e) }
+          try {
+            const u = (await env.DB.prepare('SELECT DISTINCT user_id FROM daily WHERE date >= ?').bind(since3).all<{ user_id: string }>()).results ?? []
+            for (const x of u) await runBiometrics(env, x.user_id, 3)
+          } catch (e) { console.error('biometrics cron failed', e) }
+          try {
+            const u = (await env.DB.prepare('SELECT DISTINCT user_id FROM daily WHERE date >= ?').bind(since2).all<{ user_id: string }>()).results ?? []
+            for (const x of u) await runStepsImu(env, x.user_id, 2)
+          } catch (e) { console.error('steps cron failed', e) }
+        }
+        // Prune is light D1 — always inline.
+        const cutoff = Math.floor(Date.now() / 1000) - MINUTE_RETENTION_DAYS * DAY
         await env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
       })())
     } else {
       ctx.waitUntil((async () => {
-        // Hourly safety net: process any dirty users, then close stale workouts.
-        await runAnalytics(env.DB, { historyDays: 3 })
         await autoCloseStaleWorkouts(env.DB)
-        // Steps LAST so the IMU-derived value (AN-2554) is authoritative over the
-        // minute-based one analytics writes. Refresh today + yesterday for users
-        // active in the last 2h (bounded R2 reads).
-        try {
-          const since = Math.floor(Date.now() / 1000) - 2 * 3600
-          const { results: users } = await env.DB.prepare(
-            'SELECT DISTINCT user_id FROM minute WHERE ts_min >= ?',
-          ).bind(since).all<{ user_id: string }>()
-          for (const u of users ?? []) await runStepsImu(env, u.user_id, 2)
-        } catch (e) { console.error('steps hourly cron failed', e) }
+        if (env.ANALYTICS_Q) {
+          // Enqueue a 'sweep' (processUser + incremental steps) per dirty user.
+          const dirty = (await env.DB.prepare('SELECT user_id FROM analytics_cursor WHERE dirty = 1')
+            .all<{ user_id: string }>()).results ?? []
+          await enqueueJobs(env.ANALYTICS_Q, dirty.map((u) => u.user_id), 'sweep')
+        } else {
+          // Fallback (no queue): inline.
+          await runAnalytics(env.DB, { historyDays: 3 })
+          try {
+            const since = Math.floor(Date.now() / 1000) - 2 * 3600
+            const u = (await env.DB.prepare('SELECT DISTINCT user_id FROM minute WHERE ts_min >= ?').bind(since).all<{ user_id: string }>()).results ?? []
+            for (const x of u) await runStepsIncremental(env, x.user_id)
+          } catch (e) { console.error('steps incremental cron failed', e) }
+        }
       })())
     }
   },

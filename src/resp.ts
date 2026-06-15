@@ -140,10 +140,12 @@ async function computeNight(env: RespEnv, userId: string, date: string, from: nu
  * baseline (median of nights with conf ≥ 0.5). Heavy (R2 reads) → nightly cron /
  * admin only, NEVER inline ingest.
  */
-export async function runRespRate(env: RespEnv, userId: string, days = 3): Promise<{ nights: number; computed: number }> {
-  const since = new Date(Date.now() - days * DAY * 1000).toISOString().slice(0, 10)
+export async function runRespRate(env: RespEnv, userId: string, days = 3, onlyDate?: string): Promise<{ nights: number; computed: number }> {
+  // Per-(user,day) fan-out: onlyDate → just that night; else the trailing `days`.
+  const since = onlyDate ?? new Date(Date.now() - days * DAY * 1000).toISOString().slice(0, 10)
+  const dateClause = onlyDate ? 'date = ?' : 'date >= ?'
   const { results: nights } = await env.DB.prepare(
-    'SELECT date, onset_ts, wake_ts FROM sleep WHERE user_id = ? AND date >= ? AND onset_ts IS NOT NULL AND wake_ts IS NOT NULL ORDER BY date DESC',
+    `SELECT date, onset_ts, wake_ts FROM sleep WHERE user_id = ? AND ${dateClause} AND onset_ts IS NOT NULL AND wake_ts IS NOT NULL ORDER BY date DESC`,
   ).bind(userId, since).all<{ date: string; onset_ts: number; wake_ts: number }>()
 
   let computed = 0

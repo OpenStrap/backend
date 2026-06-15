@@ -38,6 +38,10 @@ export async function getToday(c: Ctx) {
     .bind(userId).first<any>()
   const baseline = await c.env.DB.prepare('SELECT * FROM baselines WHERE user_id = ?')
     .bind(userId).first<any>()
+  // User's daily step goal (null → client default). Carried at top level so the
+  // Today step ring can render progress without a second call.
+  const u = await c.env.DB.prepare('SELECT step_goal FROM users WHERE id = ?')
+    .bind(userId).first<any>()
 
   // Live status: most recent minute (HR + worn) in the last 10 minutes.
   const live = await c.env.DB.prepare(
@@ -60,6 +64,8 @@ export async function getToday(c: Ctx) {
 
   return c.json({
     date,
+    // User's daily step goal (null → client falls back to its own default).
+    step_goal: u?.step_goal ?? null,
     // Deterministic coach plan + strain target + readiness contributors + summary.
     coach: daily?.coach ? safeParse(daily.coach) : null,
     // HRV stress (Baevsky SI + LF/HF, personal-relative) — includes its drivers.
@@ -189,6 +195,50 @@ export async function getSleep(c: Ctx) {
     need_min: needMin,
   }))
   return c.json(rows)
+}
+
+// GET /sleep/v2?from&to — multi-period sleep (naps = shorter sleeps), grouped by
+// date. Additive companion to GET /sleep (which stays the single-period shape).
+export async function getSleepV2(c: Ctx) {
+  const userId = c.get('userId')
+  const from = c.req.query('from'), to = c.req.query('to')
+  let sql = 'SELECT * FROM sleep_periods WHERE user_id = ?'
+  const binds: any[] = [userId]
+  if (from) { sql += ' AND date >= ?'; binds.push(from) }
+  if (to) { sql += ' AND date <= ?'; binds.push(to) }
+  sql += ' ORDER BY date DESC, onset_ts ASC LIMIT 400'
+  const { results } = await c.env.DB.prepare(sql).bind(...binds).all<any>()
+  const baseline = await c.env.DB.prepare('SELECT sleep_need_min FROM baselines WHERE user_id = ?')
+    .bind(userId).first<any>()
+  const needMin = (baseline?.sleep_need_min && baseline.sleep_need_min >= 180) ? baseline.sleep_need_min : 480
+  const byDate = new Map<string, any[]>()
+  for (const r of results ?? []) {
+    const p = sleepPeriodRow(r)
+    const arr = byDate.get(r.date); if (arr) arr.push(p); else byDate.set(r.date, [p])
+  }
+  const days = [...byDate.entries()].map(([date, periods]) => ({
+    date,
+    periods,
+    period_count: periods.length,
+    total_asleep_min: periods.reduce((a: number, p: any) => a + (p.duration_min || 0), 0),
+  }))
+  return c.json({ days, need_min: needMin, stages_beta: true })
+}
+
+// Shape one sleep_periods row into the API period object.
+function sleepPeriodRow(r: any) {
+  return {
+    id: r.id,
+    onset_ts: r.onset_ts,
+    wake_ts: r.wake_ts,
+    duration_min: r.duration_min,
+    in_bed_min: r.in_bed_min,
+    efficiency: r.efficiency,
+    stages: (r.light_min != null || r.deep_min != null || r.rem_min != null)
+      ? { light_min: r.light_min, deep_min: r.deep_min, rem_min: r.rem_min } : null,
+    is_main: !!r.is_main,
+    confidence: r.confidence,
+  }
 }
 
 export const getStrain = rangeRows('daily')

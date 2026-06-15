@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS users(
   height_cm REAL,
   weight_kg REAL,
   sex TEXT,                       -- 'm' | 'f' | NULL (NULL → sex-neutral calories)
+  step_goal INTEGER,              -- user's daily step goal; NULL → client default (8000)
   created_at INTEGER NOT NULL
 );
 
@@ -92,6 +93,8 @@ CREATE TABLE IF NOT EXISTS daily(
   hrv_cv REAL,                         -- coefficient of variation of nightly RMSSD (%)
   nocturnal_dip_pct REAL,              -- nocturnal HR dip (fraction) — trendable copy
   irregular TEXT,                      -- irregular-rhythm SCREEN (JSON, Poincaré) — not a diagnosis
+  strain_curve TEXT,                   -- precomputed intra-day cumulative-strain curve (JSON) so /day/strain is a pure read
+  hr_max INTEGER, hr_min INTEGER, hr_avg INTEGER,  -- precomputed day HR stats (pure-read /day/strain)
   -- NOTE: `readiness` (above) is REPURPOSED for the composite Readiness index
   -- (HRV ∩ sleep ∩ dip ∩ arousal), written by biometrics.ts.
   confidence REAL, flags TEXT, updated_at INTEGER,
@@ -105,6 +108,21 @@ CREATE TABLE IF NOT EXISTS sleep(
   confidence REAL, flags TEXT, updated_at INTEGER,
   PRIMARY KEY(user_id, date)
 );
+
+-- Sleep v2 (multi-period; naps = shorter sleeps). Additive; v1 `sleep` above is
+-- the single main-period table and stays as-is. See migrate_v6_sleep_periods.sql.
+CREATE TABLE IF NOT EXISTS sleep_periods(
+  user_id TEXT, id TEXT,
+  date TEXT,
+  onset_ts INTEGER, wake_ts INTEGER,
+  duration_min REAL, in_bed_min REAL, efficiency REAL,
+  light_min REAL, deep_min REAL, rem_min REAL,
+  is_main INTEGER,
+  confidence REAL, updated_at INTEGER,
+  PRIMARY KEY(user_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_sleep_periods_date ON sleep_periods(user_id, date);
+CREATE INDEX IF NOT EXISTS idx_sleep_periods_onset ON sleep_periods(user_id, onset_ts);
 
 CREATE TABLE IF NOT EXISTS sessions(
   user_id TEXT, id TEXT,
@@ -145,7 +163,10 @@ CREATE TABLE IF NOT EXISTS analytics_cursor(
   user_id TEXT PRIMARY KEY,
   last_min_ts INTEGER DEFAULT 0,
   dirty INTEGER DEFAULT 1,
-  last_run INTEGER DEFAULT 0
+  last_run INTEGER DEFAULT 0,
+  steps_cursor_ts INTEGER,    -- incremental steps: last settled minute counted (unix s)
+  steps_cursor_day TEXT,      -- UTC day the steps accumulator is for
+  bio_last_date TEXT          -- event-driven biometrics: last sleep-date already triggered
 );
 
 -- Per-user ingest rate-limit token bucket (RESILIENCE §7).

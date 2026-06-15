@@ -7,7 +7,7 @@
 // Missing input → null + confidence 0; never fabricated.
 
 import {
-  calcRestingHR, calcStrain, calcHrZones, calcCalories, calcSleep,
+  calcRestingHR, calcStrain, calcHrZones, calcCalories, calcSleep, calcSleepPeriods,
   calcSleepRegularity, detectSessions, calcLoad, calcFitnessTrend,
   calcVo2Max, calcFitnessModel, calcMonotony,
   calcAnomaly, calcBaselines, buildCoach,
@@ -92,6 +92,45 @@ function sleepSearchWindow(dateDayStart: number): { from: number; to: number } {
   return { from: dateDayStart - 6 * 3600, to: dateDayStart + 12 * 3600 }
 }
 
+// Precompute the intra-day cumulative-strain curve + day HR stats so /day/strain
+// is a PURE READ (no live recompute on the endpoint). Uses the SAME resolved max
+// HR + sex coefficients calcStrain used, so the curve's final point equals the
+// stored daily.strain. Curve is downsampled to keep the JSON small.
+function dayStrainDetail(
+  dayMin: Minute[], rhr: number, maxHr: number, sex?: 'm' | 'f',
+): { curve: string; hrMax: number | null; hrMin: number | null; hrAvg: number | null } {
+  const [k, b] = sex === 'f' ? [0.86, 1.67] : [0.64, 1.92]
+  const denom = Math.max(1, maxHr - rhr)
+  const scale = (trimp: number) => Math.min(21, Math.log(trimp + 1) / Math.log(1.5))
+  const sorted = [...dayMin].sort((a, c) => a.ts - c.ts)
+  let trimp = 0
+  let hrMax = 0, hrMin = 0, hrSum = 0, hrN = 0
+  const pts: { t: number; v: number }[] = []
+  for (const m of sorted) {
+    const hr = m.hr_avg
+    if (m.wrist_on && hr > 0) {
+      const ratio = Math.max(0, Math.min(1, (hr - rhr) / denom))
+      trimp += ratio * k * Math.exp(b * ratio)
+      hrMax = Math.max(hrMax, hr)
+      hrMin = hrMin === 0 ? hr : Math.min(hrMin, hr)
+      hrSum += hr; hrN++
+    }
+    pts.push({ t: m.ts, v: Math.round(scale(trimp) * 10) / 10 })
+  }
+  const MAXP = 120
+  let curvePts = pts
+  if (pts.length > MAXP) {
+    const step = pts.length / MAXP
+    curvePts = Array.from({ length: MAXP }, (_, i) => pts[Math.min(pts.length - 1, Math.floor(i * step))])
+  }
+  return {
+    curve: JSON.stringify(curvePts),
+    hrMax: hrMax || null,
+    hrMin: hrMin || null,
+    hrAvg: hrN ? Math.round(hrSum / hrN) : null,
+  }
+}
+
 interface DayBuf {
   date: string
   dayStart: number
@@ -102,12 +141,15 @@ interface DayBuf {
   calories: ReturnType<typeof calcCalories>
   sleep: Metric<SleepValue>
   wearMin: number
-  steps: number
   sleepStress: string             // calcSleepStress JSON (nocturnal arousal)
   nocturnal: string               // calcNocturnalHeart JSON
   sleepingHr: number | null       // this night's sleeping-HR avg (for baseline)
   nocturnalElevated: boolean      // overnight HR notably above baseline
   mainDrivers: Record<string, Driver[]>  // strain/rhr/sleep/zones driver graph
+  strainCurve: string             // precomputed cumulative-strain curve (JSON) for /day/strain
+  hrMax: number | null
+  hrMin: number | null
+  hrAvg: number | null
 }
 
 /**
@@ -246,6 +288,8 @@ export async function processUser(
     const zones = calcHrZones(dayMin, baseline, profile)
     const calories = calcCalories(dayMin, profile, baseline.resting_hr, zones.max_hr_used)
     dailyStrains.push({ ts: dayStart, strain: strain.score })
+    // Precompute the strain curve + HR stats here (cron) so /day/strain just reads.
+    const strainDetail = dayStrainDetail(dayMin, baseline.resting_hr, strain.max_hr_used, profile?.sex)
 
     // -- Sessions for this day. --
     const sessions = detectSessions(dayMin, baseline, profile)
@@ -274,9 +318,9 @@ export async function processUser(
         s.strain, s.kcal, s.hrr60 == null ? null : Math.round(s.hrr60), JSON.stringify(s.zones), s.confidence))
     }
 
-    // -- Wear time (worn minutes) + daily steps (sum of detected per-minute). --
+    // -- Wear time (worn minutes). Steps are owned by steps_imu.ts (AN-2554 over
+    //    the raw IMU), written separately — processUser no longer computes them. --
     const wearMin = dayMin.filter((m) => m.wrist_on).length
-    const steps = Math.round(dayMin.reduce((s, m) => s + (m.steps || 0), 0))
 
     // -- Nocturnal heart (sleeping-HR dynamics over the main sleep period). --
     const sleepWorn = (sleep.onset_ts && sleep.wake_ts)
@@ -323,13 +367,39 @@ export async function processUser(
       regularityForSleep, sleep.confidence, sleepFlags, now))
     sleepN++
 
+    // -- Sleep v2 (multi-period; naps = shorter sleeps). ADDITIVE — the v1 write
+    //    above is untouched. The window extends to THIS day's evening (18:00) so
+    //    daytime naps are captured, without pulling in the NEXT night's onset
+    //    (which belongs to date+1, same attribution convention as the night). --
+    const periodsWin = sleepMinutes(dayStart, sw.from, dayStart + 18 * 3600)
+    const sleepV2 = calcSleepPeriods(periodsWin, baseline)
+    statements.push(
+      db.prepare('DELETE FROM sleep_periods WHERE user_id = ? AND date = ?').bind(userId, date),
+    )
+    for (const p of sleepV2.periods) {
+      const pid = `${userId}:${p.onset_ts}`
+      statements.push(db.prepare(
+        'INSERT INTO sleep_periods (user_id, id, date, onset_ts, wake_ts, duration_min, in_bed_min, efficiency, light_min, deep_min, rem_min, is_main, confidence, updated_at) ' +
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, id) DO UPDATE SET ' +
+        'date=excluded.date, wake_ts=excluded.wake_ts, duration_min=excluded.duration_min, in_bed_min=excluded.in_bed_min, ' +
+        'efficiency=excluded.efficiency, light_min=excluded.light_min, deep_min=excluded.deep_min, rem_min=excluded.rem_min, ' +
+        'is_main=excluded.is_main, confidence=excluded.confidence, updated_at=excluded.updated_at',
+      ).bind(userId, pid, date, p.onset_ts, p.wake_ts, p.duration_min, p.in_bed_min, p.efficiency,
+        p.stages?.light_min ?? null, p.stages?.deep_min ?? null, p.stages?.rem_min ?? null,
+        p.is_main ? 1 : 0, p.confidence, now))
+    }
+
     dayBuffer.push({
-      date, dayStart, idx: dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin, steps,
+      date, dayStart, idx: dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin,
       sleepStress: JSON.stringify(sleepStress),
       nocturnal: JSON.stringify(nocturnal),
       sleepingHr: nocturnal.sleeping_hr_avg,
       nocturnalElevated: nocturnal.elevated,
       mainDrivers,
+      strainCurve: strainDetail.curve,
+      hrMax: strainDetail.hrMax,
+      hrMin: strainDetail.hrMin,
+      hrAvg: strainDetail.hrAvg,
     })
   }
 
@@ -337,8 +407,9 @@ export async function processUser(
   //    trailing windows that end at that day (so ACWR/fitness/SRI/anomaly vary
   //    across the history instead of collapsing to a single value). ──
   for (const buf of dayBuffer) {
-    const { date, idx, rhr, strain, zones, calories, sleep, wearMin, steps,
-      sleepStress, nocturnal, nocturnalElevated, mainDrivers } = buf
+    const { date, idx, rhr, strain, zones, calories, sleep, wearMin,
+      sleepStress, nocturnal, nocturnalElevated, mainDrivers,
+      strainCurve, hrMax, hrMin, hrAvg } = buf
 
     // Trailing windows ending at this day (inclusive).
     const sriNights = nightSummaries.slice(Math.max(0, idx - 13), idx + 1) // ~2 weeks
@@ -385,7 +456,7 @@ export async function processUser(
       recovery: { c: recovery != null ? 0.8 : 0, tier: 'HIGH', label: 'Recovery (HRV)' },
       calories: flag(calories, calories.label),
       zones: flag(zones, zones.max_hr_source === 'age' ? 'HR zones (estimated max HR)' : 'HR zones'),
-      steps: { c: steps > 0 ? 0.5 : 0, tier: 'ESTIMATE', label: 'Steps (est.)' },
+      steps: { c: wearMin > 0 ? 0.5 : 0, tier: 'ESTIMATE', label: 'Steps (est.)' },
       load: flag(load, `Load — ${load.band}`),
       fitness: flag(fitness, `Fitness trend — ${fitness.direction}`),
       anomaly: flag(anomaly, anomaly.note),
@@ -461,21 +532,25 @@ export async function processUser(
     // It writes `drivers` (main metrics) via COALESCE-free set but biometrics
     // read-merges, and on the hourly path (no biometrics) main drivers stand alone.
     statements.push(db.prepare(
-      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, steps, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, vo2max, fitness, fatigue, form, monotony, nocturnal_dip_pct, confidence, flags, updated_at) ' +
-      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
+      // NOTE: `steps` is intentionally NOT written here — steps_imu.ts is the sole,
+      // authoritative writer (AN-2554 over the raw IMU). processUser must not clobber it.
+      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, vo2max, fitness, fatigue, form, monotony, nocturnal_dip_pct, strain_curve, hr_max, hr_min, hr_avg, confidence, flags, updated_at) ' +
+      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
       'strain=excluded.strain, resting_hr=excluded.resting_hr, ' +
-      'calories=excluded.calories, wear_min=excluded.wear_min, steps=excluded.steps, hr_zones=excluded.hr_zones, ' +
+      'calories=excluded.calories, wear_min=excluded.wear_min, hr_zones=excluded.hr_zones, ' +
       'acwr=excluded.acwr, fitness_trend=excluded.fitness_trend, anomaly=excluded.anomaly, coach=excluded.coach, ' +
       'nocturnal=excluded.nocturnal, sleep_stress=excluded.sleep_stress, ' +
       'drivers=json_patch(COALESCE(daily.drivers,\'{}\'), excluded.drivers), ' +
       'vo2max=excluded.vo2max, fitness=excluded.fitness, fatigue=excluded.fatigue, form=excluded.form, ' +
       'monotony=excluded.monotony, nocturnal_dip_pct=excluded.nocturnal_dip_pct, ' +
+      'strain_curve=excluded.strain_curve, hr_max=excluded.hr_max, hr_min=excluded.hr_min, hr_avg=excluded.hr_avg, ' +
       'confidence=excluded.confidence, flags=excluded.flags, updated_at=excluded.updated_at',
     ).bind(userId, date, strain.score, rhr.resting_hr == null ? null : Math.round(rhr.resting_hr),
       calories.kcal,
-      wearMin, steps, JSON.stringify(zones), load.acwr, fitness.direction,
+      wearMin, JSON.stringify(zones), load.acwr, fitness.direction,
       bodyAlert, JSON.stringify(coach), nocturnal, sleepStress, driversJson,
       vo2.vo2max, fitModel.fitness, fitModel.fatigue, fitModel.form, monotony.monotony, nocDip,
+      strainCurve, hrMax, hrMin, hrAvg,
       confidence, flags, now))
     dailyN++
 

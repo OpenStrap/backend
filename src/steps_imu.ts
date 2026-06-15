@@ -32,10 +32,12 @@ async function rawKeysInWindow(bucket: R2Bucket, userId: string, from: number, t
   return out
 }
 
-// Steps for one UTC day: assemble per-minute accel (ordered by ts,idx), then run
-// the pure AN-2554 pedometer (analytics calcSteps) over the per-minute signals.
-async function computeDaySteps(env: StepsEnv, userId: string, dayStart: number): Promise<number> {
-  const from = dayStart, to = dayStart + DAY
+// Steps over an arbitrary [from, to) window: assemble per-minute accel (ordered by
+// ts,idx), then run the pure AN-2554 pedometer (analytics calcSteps). calcSteps is
+// per-minute-independent (it sums pedometer(minute) × GAIN), so the count over a
+// window is exactly the sum of the counts over any partition of it into whole
+// minutes — which is what makes incremental accumulation exact.
+async function computeWindowSteps(env: StepsEnv, userId: string, from: number, to: number): Promise<number> {
   const keys = await rawKeysInWindow(env.RAW_BUCKET, userId, from, to)
   // DEDUP by (ts, idx): R2 upload windows overlap, so the same frame appears in
   // multiple objects — without this, samples (and steps) are double-counted.
@@ -67,21 +69,100 @@ async function computeDaySteps(env: StepsEnv, userId: string, dayStart: number):
   return calcSteps(minuteSignals)
 }
 
+// Minutes are considered "settled" (safe to count incrementally) once they're this
+// old, giving late/bursty band syncs time to land. Anything later is caught by the
+// nightly full recompute. 30 min matches the sweep cadence.
+const SETTLE_GRACE = 1800
+
+function ymd(dayStart: number): string {
+  return new Date(dayStart * 1000).toISOString().slice(0, 10)
+}
+
 /**
- * runStepsImu — recompute steps for the last `days` UTC days from R2 IMU and store
- * on daily.steps. Authoritative source of steps (analytics no longer needs to be).
+ * runStepsIncremental — the 30-min-sweep path. Counts only the minutes that have
+ * newly SETTLED since the last run (a few R2 objects) and accumulates into
+ * daily.steps via a per-user cursor. Exact for settled data (per-minute pedometer);
+ * the nightly full recompute trues up any late-arriving frames. Cheap: bounded R2
+ * reads per run regardless of how long the day is or how many users.
  */
-export async function runStepsImu(env: StepsEnv, userId: string, days = 1): Promise<{ days: number; total: number }> {
+export async function runStepsIncremental(env: StepsEnv, userId: string): Promise<{ added: number }> {
   const now = Math.floor(Date.now() / 1000)
+  const todayStart = Math.floor(now / DAY) * DAY
+  const date = ymd(todayStart)
+  const settledCutoff = Math.floor((now - SETTLE_GRACE) / 60) * 60 // last fully-settled minute boundary
+
+  const cur = await env.DB.prepare(
+    'SELECT steps_cursor_ts, steps_cursor_day FROM analytics_cursor WHERE user_id = ?',
+  ).bind(userId).first<{ steps_cursor_ts: number | null; steps_cursor_day: string | null }>()
+  const sameDay = !!cur && cur.steps_cursor_day === date && cur.steps_cursor_ts != null
+  const cursor = sameDay ? cur!.steps_cursor_ts! : todayStart
+
+  const setCursor = env.DB.prepare(
+    'INSERT INTO analytics_cursor (user_id, steps_cursor_ts, steps_cursor_day) VALUES (?,?,?) ' +
+    'ON CONFLICT(user_id) DO UPDATE SET steps_cursor_ts=excluded.steps_cursor_ts, steps_cursor_day=excluded.steps_cursor_day',
+  )
+
+  if (settledCutoff <= cursor) {
+    // Nothing newly settled. On a fresh day, still seed the row at 0 + set cursor.
+    if (!sameDay) {
+      await env.DB.batch([
+        env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?,?)').bind(userId, date),
+        env.DB.prepare('UPDATE daily SET steps = 0 WHERE user_id = ? AND date = ?').bind(userId, date),
+        setCursor.bind(userId, todayStart, date),
+      ])
+    }
+    return { added: 0 }
+  }
+
+  const chunk = await computeWindowSteps(env, userId, cursor, settledCutoff)
+  await env.DB.batch([
+    env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?,?)').bind(userId, date),
+    sameDay
+      ? env.DB.prepare('UPDATE daily SET steps = COALESCE(steps,0) + ? WHERE user_id = ? AND date = ?').bind(chunk, userId, date)
+      : env.DB.prepare('UPDATE daily SET steps = ? WHERE user_id = ? AND date = ?').bind(chunk, userId, date),
+    setCursor.bind(userId, settledCutoff, date),
+  ])
+  return { added: chunk }
+}
+
+/**
+ * runStepsImu — FULL recompute for the last `days` UTC days from R2 IMU. The
+ * authoritative true-up: catches late-arriving frames the incremental path may
+ * have missed. For TODAY it also realigns the incremental cursor so the sweep
+ * continues from the trued-up baseline without double-counting.
+ */
+export async function runStepsImu(env: StepsEnv, userId: string, days = 1, onlyDate?: string): Promise<{ days: number; total: number }> {
+  const now = Math.floor(Date.now() / 1000)
+  const todayStart = Math.floor(now / DAY) * DAY
+  const settledCutoff = Math.floor((now - SETTLE_GRACE) / 60) * 60
   let grand = 0
-  for (let d = 0; d < days; d++) {
-    const dayStart = Math.floor((now - d * DAY) / DAY) * DAY
-    const date = new Date(dayStart * 1000).toISOString().slice(0, 10)
-    const steps = await computeDaySteps(env, userId, dayStart)
-    await env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?,?)').bind(userId, date).run()
-    await env.DB.prepare('UPDATE daily SET steps = ? WHERE user_id = ? AND date = ?')
-      .bind(steps, userId, date).run()
-    grand += steps
+  // Per-(user,day) fan-out: onlyDate → just that day; else the trailing `days`.
+  const dayStarts = onlyDate
+    ? [Math.floor(Date.parse(`${onlyDate}T00:00:00Z`) / 1000)]
+    : Array.from({ length: days }, (_, d) => Math.floor((now - d * DAY) / DAY) * DAY)
+  for (const dayStart of dayStarts) {
+    const date = ymd(dayStart)
+    if (dayStart === todayStart) {
+      // Today: count only settled minutes (consistent with the incremental path)
+      // and realign the cursor so the next sweep appends from here.
+      const steps = await computeWindowSteps(env, userId, todayStart, settledCutoff)
+      await env.DB.batch([
+        env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?,?)').bind(userId, date),
+        env.DB.prepare('UPDATE daily SET steps = ? WHERE user_id = ? AND date = ?').bind(steps, userId, date),
+        env.DB.prepare(
+          'INSERT INTO analytics_cursor (user_id, steps_cursor_ts, steps_cursor_day) VALUES (?,?,?) ' +
+          'ON CONFLICT(user_id) DO UPDATE SET steps_cursor_ts=excluded.steps_cursor_ts, steps_cursor_day=excluded.steps_cursor_day',
+        ).bind(userId, settledCutoff, date),
+      ])
+      grand += steps
+    } else {
+      // Past days are fully settled → count the whole day.
+      const steps = await computeWindowSteps(env, userId, dayStart, dayStart + DAY)
+      await env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?,?)').bind(userId, date).run()
+      await env.DB.prepare('UPDATE daily SET steps = ? WHERE user_id = ? AND date = ?')
+        .bind(steps, userId, date).run()
+      grand += steps
+    }
   }
   return { days, total: grand }
 }
