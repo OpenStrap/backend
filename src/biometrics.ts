@@ -144,10 +144,12 @@ interface DailyHistRow { date: string; resting_hr: number | null; hrv_rmssd: num
  * (Mahalanobis). Writes those + their drivers to the daily row. Heavy (R2 reads) →
  * nightly cron / admin only, never inline ingest.
  */
-export async function runBiometrics(env: BioEnv, userId: string, days = 3): Promise<{ days: number; computed: number }> {
+export async function runBiometrics(env: BioEnv, userId: string, days = 3, onlyDate?: string): Promise<{ days: number; computed: number }> {
   const now = Math.floor(Date.now() / 1000)
 
-  const since = new Date((now - days * DAY) * 1000).toISOString().slice(0, 10)
+  // Per-(user,day) fan-out: when onlyDate is set, process exactly that one UTC day
+  // (a single bounded unit). Otherwise the trailing `days`.
+  const since = onlyDate ?? new Date((now - days * DAY) * 1000).toISOString().slice(0, 10)
   const { results: sleeps } = await env.DB.prepare(
     'SELECT date, onset_ts, wake_ts, duration_min FROM sleep WHERE user_id = ? AND date >= ? AND onset_ts IS NOT NULL AND wake_ts IS NOT NULL',
   ).bind(userId, since).all<{ date: string; onset_ts: number; wake_ts: number; duration_min: number | null }>()
@@ -174,9 +176,17 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3): Prom
   const TOTAL_OBJECTS = 24
   let spent = 0
   const out: NightBio[] = []
-  for (let d = 0; d < days; d++) {
-    const dayStart = Math.floor((now - d * DAY) / DAY) * DAY
-    const date = new Date(dayStart * 1000).toISOString().slice(0, 10)
+  // Build the explicit list of (dayStart, date) to process.
+  const dayList: { dayStart: number; date: string }[] = []
+  if (onlyDate) {
+    dayList.push({ dayStart: Math.floor(Date.parse(`${onlyDate}T00:00:00Z`) / 1000), date: onlyDate })
+  } else {
+    for (let d = 0; d < days; d++) {
+      const ds = Math.floor((now - d * DAY) / DAY) * DAY
+      dayList.push({ dayStart: ds, date: new Date(ds * 1000).toISOString().slice(0, 10) })
+    }
+  }
+  for (const { dayStart, date } of dayList) {
     const budget = Math.min(PER_DAY, TOTAL_OBJECTS - spent)
     if (budget <= 0) { out.push({ date, rmssd: null, sdnn: null, lfhf: null, si: null, resp: null, respConf: 0, nBeats: 0, temp: null, spo2: null, rr: [] }); continue }
     const sl = sleepByDate.get(date)

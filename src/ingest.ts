@@ -43,16 +43,13 @@ interface IngestEnv {
   ANALYTICS_Q?: Queue
 }
 
-async function enqueueOrMarkDirty(env: IngestEnv, userId: string, upto: number) {
-  if (env.ANALYTICS_Q) {
-    try {
-      await env.ANALYTICS_Q.send({ user_id: userId, upto })
-      return
-    } catch (e) {
-      console.error('queue send failed; falling back to dirty flag', e)
-    }
-  }
-  // Fallback: mark dirty for the cron sweep.
+// Mark the user dirty so the NEXT 30-min cron sweep enqueues exactly ONE analytics
+// job for them (deduped). We deliberately do NOT enqueue per ingest batch: at scale
+// that storms the queue (~240 msgs/user/day) and re-derives the same day hundreds of
+// times. A cheap dirty flag here + the cron as the single enqueue point makes it one
+// sweep per user per 30 min. Freshness is bounded by the sweep interval (fine — and
+// recovery still fires promptly on wake via the sleep-detection trigger).
+async function markUserDirty(env: IngestEnv, userId: string) {
   await env.DB.prepare(
     'INSERT INTO analytics_cursor (user_id, last_min_ts, dirty) VALUES (?,0,1) ' +
     'ON CONFLICT(user_id) DO UPDATE SET dirty = 1',
@@ -130,7 +127,7 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
   //    /ingest/events route handles event-only payloads. Here we skip.
 
   // 6. Enqueue analytics (or mark dirty). Never run inline.
-  if (minutesWritten > 0) await enqueueOrMarkDirty(c.env, userId, maxTsMin || Math.floor(Date.now() / 1000))
+  if (minutesWritten > 0) await markUserDirty(c.env, userId)
 
   // 7. Respond. `received` = records persisted raw to R2 (the re-decodable system of
   //    record); `decoded` = records that yielded a surfaceable sample; `minutes_written`
