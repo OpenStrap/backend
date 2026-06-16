@@ -52,13 +52,21 @@ the request path.
 
 ## Where the metrics actually get computed
 
-`analytics.ts` is the brain, and it runs on a cron . Two schedules,
-both in `wrangler.toml`:
+`analytics.ts` is the brain, and it runs on a cron. Two schedules, both in
+`wrangler.toml`:
 
-- **Every hour** (`runAnalytics` with a 3-day window): re-derive every dirty user. This
-  is the safety net, it catches anyone the queue missed.
-- **Every night at 3:30** (2-day window): a fuller pass, plus respiratory rate for anyone
-  who slept recently, plus pruning minute rows older than 90 days.
+- **Every 30 minutes** (`*/30`): a light sweep — re-derive every dirty user (their daily
+  numbers, sleep, incremental steps), and the moment a night actually finishes, kick off
+  that night's HRV. Cheap work only; the heavy R2 re-decodes are fanned out onto a queue,
+  one bounded `(user, day)` unit per consumer invocation.
+- **Every night at 3:30** (`30 3`): the backstop — re-decode HRV and respiratory rate
+  only for the recent nights still *missing* them (so a night is never decoded twice, and
+  a night the wake-time run left empty gets retried), true up steps, and prune minute rows
+  past their retention. Anything already computed is skipped.
+
+HRV is real now: the beat-to-beat R-R intervals live in the 1 Hz (V24) records, so
+`biometrics.ts` re-decodes them from the raw bytes in R2 (off the request path) to drive
+recovery, readiness, and HRV-based stress.
 
 `processUser` is where it happens for one person. It reads their minutes, pulls their
 baselines, and calls into the [analytics package](https://github.com/OpenStrap/analytics)
@@ -84,6 +92,9 @@ moment it starts inventing numbers, so it doesn't.
 | `decode.ts` | Hex frames into decoded samples |
 | `rollup.ts` | Decoded samples into per-minute buckets |
 | `analytics.ts` | The cron brain, `processUser` / `runAnalytics` |
+| `queue.ts` | The queue consumer: one bounded `(user, job, day)` unit per invocation, and the wake-time HRV trigger |
+| `biometrics.ts` | HRV (RMSSD/SDNN/LF-HF), recovery, stress, relative temp/SpO₂ — re-decoded from the R-R intervals in R2 |
+| `steps_imu.ts` | Step counting from the wrist accelerometer (incremental + nightly true-up) |
 | `query.ts` | The read endpoints: today, sleep, strain, trends, chart, history |
 | `daydetail.ts` | Single-day drill-downs (the strain curve, the hypnogram, the stress band) |
 | `history.ts` | Range aggregation and the calendar heatmap |
