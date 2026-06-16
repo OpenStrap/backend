@@ -461,15 +461,27 @@ export default {
           // Fan out per (user, job): each consumer invocation = one bounded unit.
           const dailyU = (await env.DB.prepare('SELECT DISTINCT user_id FROM daily WHERE date >= ?')
             .bind(since3).all<{ user_id: string }>()).results ?? []
-          const sleepU = (await env.DB.prepare('SELECT DISTINCT user_id FROM sleep WHERE date >= ? AND onset_ts IS NOT NULL')
-            .bind(since2).all<{ user_id: string }>()).results ?? []
           const ids = dailyU.map((u) => u.user_id)
-          // 'sweep' = one per user (D1 + incremental steps, light). Heavy R2 jobs
-          // fan out per (user, day) so each unit reads ≤ one day — bounded for ANY user.
+          // 'sweep' = one per user (D1 + incremental steps, light). 'steps_full' =
+          // late-frame true-up, per (user, day).
           await enqueueJobs(env.ANALYTICS_Q, ids, 'sweep')
-          await enqueueJobDays(env.ANALYTICS_Q, ids, 'biometrics', lastNDates(3))
           await enqueueJobDays(env.ANALYTICS_Q, ids, 'steps_full', lastNDates(2))
-          await enqueueJobDays(env.ANALYTICS_Q, sleepU.map((u) => u.user_id), 'resp', lastNDates(2))
+          // Biometrics + resp are the expensive R2 re-decodes. Enqueue ONLY the
+          // (user, day) nights still MISSING the metric in the last 2 days — this
+          // skips every already-scored night (no redundant decode vs the
+          // event-driven fire) AND retries nights the event fire left null
+          // (self-healing). The single biggest R2 cost saver.
+          const bioNeed = (await env.DB.prepare(
+            'SELECT user_id, date FROM daily WHERE date >= ? AND hrv_rmssd IS NULL',
+          ).bind(since2).all<{ user_id: string; date: string }>()).results ?? []
+          await sendChunked(env.ANALYTICS_Q,
+            bioNeed.map((r) => ({ body: { user_id: r.user_id, job: 'biometrics', day: r.date } as AnalyticsMessage })))
+          const respNeed = (await env.DB.prepare(
+            'SELECT d.user_id, d.date FROM daily d WHERE d.date >= ? AND d.resp_rate IS NULL ' +
+            'AND EXISTS (SELECT 1 FROM sleep s WHERE s.user_id = d.user_id AND s.date = d.date AND s.onset_ts IS NOT NULL)',
+          ).bind(since2).all<{ user_id: string; date: string }>()).results ?? []
+          await sendChunked(env.ANALYTICS_Q,
+            respNeed.map((r) => ({ body: { user_id: r.user_id, job: 'resp', day: r.date } as AnalyticsMessage })))
         } else {
           // Fallback (no queue): inline. Only viable at small scale.
           await runAnalytics(env.DB, { historyDays: 2 })
@@ -497,7 +509,17 @@ export default {
           // Enqueue a 'sweep' (processUser + incremental steps) per dirty user.
           const dirty = (await env.DB.prepare('SELECT user_id FROM analytics_cursor WHERE dirty = 1')
             .all<{ user_id: string }>()).results ?? []
-          await enqueueJobs(env.ANALYTICS_Q, dirty.map((u) => u.user_id), 'sweep')
+          const dids = dirty.map((u) => u.user_id)
+          await enqueueJobs(env.ANALYTICS_Q, dids, 'sweep')
+          // Optimistically clear dirty for exactly the users we enqueued, so a
+          // persistently-failing sweep isn't re-enqueued every 30 min (a user
+          // re-dirtied after this SELECT keeps dirty=1 and is caught next tick).
+          for (let i = 0; i < dids.length; i += 100) {
+            const chunk = dids.slice(i, i + 100)
+            await env.DB.prepare(
+              `UPDATE analytics_cursor SET dirty = 0 WHERE user_id IN (${chunk.map(() => '?').join(',')})`,
+            ).bind(...chunk).run()
+          }
         } else {
           // Fallback (no queue): inline.
           await runAnalytics(env.DB, { historyDays: 3 })

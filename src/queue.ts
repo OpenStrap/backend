@@ -36,8 +36,17 @@ async function maybeTriggerBiometrics(env: QueueEnv, userId: string): Promise<vo
   if (!sleep) return
   const now = Math.floor(Date.now() / 1000)
   if (sleep.wake_ts > now - 600) return // woke <10 min ago → let the night settle; next sweep gets it
+  // Already have HRV for this night (nightly backstop or an earlier fire computed
+  // it)? Nothing to do — never re-decode R2 for a night we've already scored.
+  const have = await env.DB.prepare(
+    'SELECT 1 FROM daily WHERE user_id = ? AND date = ? AND hrv_rmssd IS NOT NULL',
+  ).bind(userId, sleep.date).first()
+  if (have) return
   const cur = await env.DB.prepare('SELECT bio_last_date FROM analytics_cursor WHERE user_id = ?')
     .bind(userId).first<{ bio_last_date: string | null }>()
+  // Cost cap: fire the heavy R2 decode at most ONCE per night from the event path.
+  // If that fire yields null (partial/late R2), the nightly cron retries missing
+  // nights — so we never spam the decode every 30-min sweep.
   if (cur?.bio_last_date && cur.bio_last_date >= sleep.date) return // already fired for this night
   await env.ANALYTICS_Q.send({ user_id: userId, job: 'biometrics', day: sleep.date })
   await env.ANALYTICS_Q.send({ user_id: userId, job: 'resp', day: sleep.date })
