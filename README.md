@@ -33,8 +33,12 @@ When a batch lands, `ingest.ts` does four things in order:
    borrowed from the protocol package) and the IMU-bearing R10 are the ones that carry
    real signal.
 3. **Saves the raw bytes to R2** under `raw/{you}/{device}/{when}-{first}-{last}.txt`,
-   one frame per line. This is the bit I never throw away. Minute rollups get pruned after
-   90 days; the raw frames stay so they can be re-decoded forever.
+   one frame per line — the system of record for re-decoding. Retention is short and
+   layered: raw R2 objects expire at **14 days** (an R2 bucket lifecycle rule, matching
+   `RAW_RETENTION_DAYS` — the re-decode horizon), the per-minute `minute` table and the
+   device `events` table are pruned at **10 days**, and the *derived* tables (`daily`,
+   `sleep`, `baselines`) are **kept permanently** — that's what the long-window trend
+   metrics read from, so nothing needs re-decoding past 10 days.
 4. **Rolls everything into minutes.** `rollup.ts` buckets the decoded samples by
    `floor(ts/60)*60` and writes them to the `minute` table.
 
@@ -76,6 +80,12 @@ signal, the coach plan, stress, nocturnal heart. The results land in `daily`, `s
 `sessions`, and `baselines`. I keep this on a trailing window per day so the numbers
 actually move day to day instead of collapsing into one flat value, which was a real bug
 early on.
+
+The cross-day metrics that need long windows — training load (EWMA acute:chronic over
+7/28 days), Banister fitness/fatigue/form, Foster monotony, sleep regularity — are
+**seeded from the permanent `daily`/`sleep` tables**, not just the few days being
+recomputed. We never re-decode old days (raw is gone after 14 days); we reuse the
+already-derived rows, so a real 28-day ACWR or 14-night regularity actually exists.
 
 Every number comes back wrapped: a value, a unit, a confidence between 0 and 1, a tier,
 and a label. If the inputs aren't there, the value is `null` and the confidence is `0`. I
@@ -130,7 +140,7 @@ Admin stuff for when you run your own: `/admin/run-analytics`, `/admin/run-resp`
 ## The database
 
 Thirteen tables. The ones you'll care about: `minute` (the running-sum rollups, pruned at
-90 days), `daily` and `sleep` and `sessions` (the derived output, mostly JSON columns for
+10 days), `daily` and `sleep` and `sessions` (the derived output, mostly JSON columns for
 the structured bits like coach plans and HR zones), `baselines` (your resting HR, max HR,
 sleep need, the anchors everything else is measured against), and the auth trio (`users`,
 `otps`, `refresh_tokens`). Full DDL is in `src/db/schema.sql`, it's commented, go read it.
