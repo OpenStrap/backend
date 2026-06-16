@@ -232,13 +232,18 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3, onlyD
     // Composite Readiness — recovery (HRV) ∩ sleep vs need ∩ nocturnal dip ∩ arousal.
     // Read this day's dip + sleep-stress (written by processUser) alongside drivers.
     await env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?, ?)').bind(userId, o.date).run()
-    const existing = await env.DB.prepare('SELECT drivers, sleep_stress, nocturnal_dip_pct FROM daily WHERE user_id = ? AND date = ?')
-      .bind(userId, o.date).first<{ drivers: string | null; sleep_stress: string | null; nocturnal_dip_pct: number | null }>()
-    let drivers: Record<string, unknown> = {}
-    try { drivers = existing?.drivers ? JSON.parse(existing.drivers) : {} } catch { drivers = {} }
-    if (recovery.drivers) drivers.recovery = recovery.drivers
-    if (stress.drivers) drivers.stress = stress.drivers
-    if (illness.drivers) drivers.illness = illness.drivers
+    const existing = await env.DB.prepare('SELECT sleep_stress, nocturnal_dip_pct FROM daily WHERE user_id = ? AND date = ?')
+      .bind(userId, o.date).first<{ sleep_stress: string | null; nocturnal_dip_pct: number | null }>()
+    // Only the driver keys biometrics OWNS. We merge these into daily.drivers via
+    // SQL json_patch at write time (below) rather than read-modify-write, so a
+    // concurrent processUser sweep writing the MAIN drivers can't be clobbered by a
+    // stale snapshot (the previous read→merge→overwrite had a TOCTOU window: a
+    // 'sweep' and a 'biometrics' for the same user are distinct queue jobs and run
+    // concurrently). json_patch is additive + order-independent for disjoint keys.
+    const bioDrivers: Record<string, unknown> = {}
+    if (recovery.drivers) bioDrivers.recovery = recovery.drivers
+    if (stress.drivers) bioDrivers.stress = stress.drivers
+    if (illness.drivers) bioDrivers.illness = illness.drivers
 
     const sleepStressScore = (() => { try { return existing?.sleep_stress ? JSON.parse(existing.sleep_stress)?.score ?? null : null } catch { return null } })()
     const readiness = calcReadinessIndex({
@@ -248,19 +253,20 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3, onlyD
       dipPct: existing?.nocturnal_dip_pct ?? null,
       sleepStress: sleepStressScore,
     })
-    if (readiness.drivers) drivers.readiness = readiness.drivers
+    if (readiness.drivers) bioDrivers.readiness = readiness.drivers
 
     await env.DB.prepare(
       'UPDATE daily SET recovery = ?, hrv_rmssd = ?, hrv_conf = ?, hrv_sdnn = ?, hrv_lfhf = ?, hrv_si = ?, ' +
       'hrv_cv = ?, irregular = ?, readiness = ?, ' +
       'resp_rate = COALESCE(?, resp_rate), resp_conf = COALESCE(?, resp_conf), ' +
-      'skin_temp_idx = ?, spo2_idx = ?, stress = ?, illness = ?, drivers = ?, updated_at = ? ' +
+      'skin_temp_idx = ?, spo2_idx = ?, stress = ?, illness = ?, ' +
+      'drivers = json_patch(COALESCE(drivers, \'{}\'), ?), updated_at = ? ' +
       'WHERE user_id = ? AND date = ?',
     ).bind(
       recovery.score, o.rmssd, conf, o.sdnn, o.lfhf, o.si,
       hrvStab.cv, JSON.stringify(irregular), readiness.score,
       o.respConf >= 0.3 ? o.resp : null, o.respConf >= 0.3 ? o.respConf : null,
-      tempIdx, spo2Idx, JSON.stringify(stress), JSON.stringify(illness), JSON.stringify(drivers), now,
+      tempIdx, spo2Idx, JSON.stringify(stress), JSON.stringify(illness), JSON.stringify(bioDrivers), now,
       userId, o.date,
     ).run()
     if (o.rmssd != null) computed++
