@@ -410,7 +410,8 @@ app.post('/admin/wipe-raw', async (c) => {
 app.post('/admin/prune', async (c) => {
   const cutoff = Math.floor(Date.now() / 1000) - MINUTE_RETENTION_DAYS * DAY
   const res = await c.env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
-  return c.json({ ok: true, deleted: res.meta?.changes ?? 0, cutoff })
+  const ev = await c.env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(cutoff).run()
+  return c.json({ ok: true, deleted: res.meta?.changes ?? 0, events_deleted: ev.meta?.changes ?? 0, cutoff })
 })
 
 // Send messages in sendBatch chunks of 100 (the Queues per-call max), so the cron
@@ -498,9 +499,11 @@ export default {
             for (const x of u) await runStepsImu(env, x.user_id, 2)
           } catch (e) { console.error('steps cron failed', e) }
         }
-        // Prune is light D1 — always inline.
+        // Prune is light D1 — always inline. Minute + events share the same
+        // drill-down window (/day/timeline), so they age out together.
         const cutoff = Math.floor(Date.now() / 1000) - MINUTE_RETENTION_DAYS * DAY
         await env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
+        await env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(cutoff).run()
       })())
     } else {
       ctx.waitUntil((async () => {
