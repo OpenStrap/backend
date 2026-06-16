@@ -446,7 +446,7 @@ export async function processUser(
     const anomaly = calcAnomaly({
       recent_rhr: recentRhr,
       skin_temp: baseline.skin_temp ?? null,
-      sleep_efficiency: sleep.efficiency || null,
+      sleep_efficiency: sleep.efficiency != null ? sleep.efficiency : null, // keep a real 0% (not coerced to "no data")
       baseline_sleep_efficiency: null,
     }, baseline)
 
@@ -514,7 +514,7 @@ export async function processUser(
       sleep_last_min: sleep.duration_min || null,
       sleep_need_min: needFloored,
       sleep_debt_min: sleepDebt,
-      sleep_efficiency: sleep.efficiency || null,
+      sleep_efficiency: sleep.efficiency != null ? sleep.efficiency : null, // keep a real 0% (not coerced to "no data")
       sri: sri.sri,
       fitness_direction: fitness.direction,
       anomaly: bodyAlert ? JSON.parse(bodyAlert) : null,
