@@ -188,12 +188,18 @@ export async function processUser(
   ).bind(userId).all<{ date: string; recovery: number }>()
   const recoveryByDate = new Map((recRows ?? []).map((r) => [r.date, r.recovery]))
 
-  // ── Pass 1: recompute baselines from prior derived history (last 30 days). ──
+  // ── Pass 1: recompute baselines from prior derived history. ──
+  // 90 days (not 30): baselines use the most-recent 30, but the trailing-window
+  // metrics (ACWR/monotony/RHR-trend, and SRI from sleep) need a longer seed —
+  // EWMA chronic (τ=28) wants ~3× that to converge. These are permanent derived
+  // rows and D1 reads are effectively free at this scale, so the longer read is
+  // ~$0. We NEVER re-decode old days (minute data is pruned at 10d); we just
+  // reuse what was already computed. Forward-only, no backfill.
   const { results: histRows } = await db.prepare(
-    'SELECT date, resting_hr, strain, hr_zones FROM daily WHERE user_id = ? ORDER BY date DESC LIMIT 30',
+    'SELECT date, resting_hr, strain, hr_zones FROM daily WHERE user_id = ? ORDER BY date DESC LIMIT 90',
   ).bind(userId).all<any>()
   const { results: sleepHistRows } = await db.prepare(
-    'SELECT date, duration_min FROM sleep WHERE user_id = ? ORDER BY date DESC LIMIT 30',
+    'SELECT date, duration_min, onset_ts, wake_ts FROM sleep WHERE user_id = ? ORDER BY date DESC LIMIT 90',
   ).bind(userId).all<any>()
   const sleepByDate = new Map<string, number>()
   for (const s of sleepHistRows ?? []) if (s.duration_min != null) sleepByDate.set(s.date, s.duration_min)
@@ -213,7 +219,8 @@ export async function processUser(
   })
 
   if (history.length > 0) {
-    const bl = calcBaselines(history, profile)
+    // Baselines stay a 30-day metric even though we now fetch 90 for the windows.
+    const bl = calcBaselines(history.slice(-30), profile)
     baseline = {
       resting_hr: bl.resting_hr ?? baseline.resting_hr,
       max_hr: bl.max_hr ?? baseline.max_hr,
@@ -261,6 +268,44 @@ export async function processUser(
     for (const m of prev) if (m.ts >= from && m.ts < to) out.push(m)
     for (const m of cur) if (m.ts >= from && m.ts < to) out.push(m)
     return out
+  }
+
+  // ── Seed the trailing-window series from DURABLE derived history, so the
+  //    cross-day metrics in Pass 3 (ACWR/monotony/RHR-trend/SRI) see their true
+  //    28/14/7-day windows instead of just the ~3-day recompute window. We reuse
+  //    the daily/sleep rows already fetched above (no extra query, no re-decode).
+  //    Gaps INSIDE the active span are genuine rest days → strain 0; days before
+  //    the user's earliest derived row are NOT fabricated (else a young account
+  //    gets a tiny chronic and a bogus high ACWR).
+  const SEED_DAYS = 84 // ≈3× the 28-day chronic time constant
+  let seedLen = 0
+  {
+    const dayStrain = new Map<string, number>()
+    const dayRhr = new Map<string, number>()
+    for (const d of histRows ?? []) {
+      if (d.strain != null) dayStrain.set(d.date, d.strain)
+      if (d.resting_hr != null) dayRhr.set(d.date, d.resting_hr)
+    }
+    const dayWake = new Map<string, { onset: number | null; wake: number | null }>()
+    for (const s of sleepHistRows ?? []) dayWake.set(s.date, { onset: s.onset_ts ?? null, wake: s.wake_ts ?? null })
+
+    // Earliest derived day within the seed window — start the continuous series
+    // there (don't 0-fill pre-account days).
+    const windowStart = firstDayStart - SEED_DAYS * DAY
+    let seedStart = firstDayStart
+    for (let d = windowStart; d < firstDayStart; d += DAY) {
+      const k = dayKey(d)
+      if (dayStrain.has(k) || dayRhr.has(k) || dayWake.has(k)) { seedStart = d; break }
+    }
+    for (let d = seedStart; d < firstDayStart; d += DAY) {
+      const k = dayKey(d)
+      dailyStrains.push({ ts: d, strain: dayStrain.get(k) ?? 0 }) // intra-span gap = rest day
+      rhrSeries.push(dayRhr.get(k) ?? null)
+      hrrSeries.push(null) // HRR isn't stored per-day → fitness-trend HRR stays sparse
+      const w = dayWake.get(k)
+      nightSummaries.push({ onset_ts: w?.onset ?? null, wake_ts: w?.wake ?? null })
+      seedLen++
+    }
   }
 
   for (let dayStart = firstDayStart; dayStart <= lastDayStart; dayStart += DAY) {
@@ -390,7 +435,9 @@ export async function processUser(
     }
 
     dayBuffer.push({
-      date, dayStart, idx: dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin,
+      // idx points into the parallel arrays, which now START with `seedLen`
+      // seeded history days — so trailing slices in Pass 3 reach into real history.
+      date, dayStart, idx: seedLen + dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin,
       sleepStress: JSON.stringify(sleepStress),
       nocturnal: JSON.stringify(nocturnal),
       sleepingHr: nocturnal.sleeping_hr_avg,
