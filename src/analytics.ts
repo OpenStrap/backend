@@ -196,7 +196,7 @@ export async function processUser(
   // ~$0. We NEVER re-decode old days (minute data is pruned at 10d); we just
   // reuse what was already computed. Forward-only, no backfill.
   const { results: histRows } = await db.prepare(
-    'SELECT date, resting_hr, strain, hr_zones FROM daily WHERE user_id = ? ORDER BY date DESC LIMIT 90',
+    'SELECT date, resting_hr, strain, hr_zones, hr_max FROM daily WHERE user_id = ? ORDER BY date DESC LIMIT 90',
   ).bind(userId).all<any>()
   const { results: sleepHistRows } = await db.prepare(
     'SELECT date, duration_min, onset_ts, wake_ts FROM sleep WHERE user_id = ? ORDER BY date DESC LIMIT 90',
@@ -214,6 +214,11 @@ export async function processUser(
       resting_hr: d.resting_hr ?? undefined,
       daily_strain: d.strain ?? undefined,
       sleep_duration_min: sleepByDate.get(d.date),
+      // The day's observed HR peak. calcBaselines only trusts it as a measured
+      // HRmax when it clears the age-predicted floor (a genuine effort); otherwise
+      // it falls back to Tanaka. Without this, the measured-max path was dead and
+      // everyone ran on the age formula. Forward-only, reuses the daily row.
+      session_hr_max: d.hr_max ?? undefined,
       zone_min,
     } as DayHistory
   })

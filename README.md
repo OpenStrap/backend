@@ -45,10 +45,19 @@ When a batch lands, `ingest.ts` does four things in order:
 The `minute` table is the one clever bit worth understanding before you touch anything.
 It doesn't store an average heart rate, it stores the running pieces: `hr_sum`, `hr_n`,
 `act_sum`, `act_n`, plus min/max. The upsert adds the new pieces onto whatever's already
-there. The reason is that uploads aren't clean. The phone retries, batches overlap, the
-same frame shows up twice. If I stored averages I'd corrupt them on every double-send.
-Storing sums means re-uploading the exact same data converges to the exact same answer.
-Idempotency for free. Don't break this.
+there. The reason is that uploads aren't clean. The phone retries and batches overlap, so
+a day's frames arrive split across many POSTs in no particular order. Storing running sums
+makes the minute totals **order- and partition-independent**: chop the same frames into any
+set of batches, in any order, and the minute rollups come out identical. If I stored
+averages instead, the split would corrupt them.
+
+One honest caveat, because it's easy to misread this as "duplicate-proof": the upsert is
+*additive*, so the **same frame delivered in two separate POSTs is counted twice.** This is
+not idempotent against duplicate sends on its own — it relies on the client deduping frames
+before they ever hit here. The app does exactly that: `raw_records` has the frame hex as a
+primary key (`INSERT OR IGNORE`) and only deletes a record after a 200, so each frame is
+POSTed once. Keep that contract; if you ever ingest from a client without it, dedup frames
+server-side before the rollup. Don't break this.
 
 Once minutes are written, the user gets flagged dirty (or pushed onto a queue if you've
 got the paid plan), and that's where ingest stops. The heavy math is deliberately not on

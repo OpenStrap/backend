@@ -115,13 +115,36 @@ export async function runStepsIncremental(env: StepsEnv, userId: string): Promis
   }
 
   const chunk = await computeWindowSteps(env, userId, cursor, settledCutoff)
-  await env.DB.batch([
-    env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?,?)').bind(userId, date),
-    sameDay
-      ? env.DB.prepare('UPDATE daily SET steps = COALESCE(steps,0) + ? WHERE user_id = ? AND date = ?').bind(chunk, userId, date)
-      : env.DB.prepare('UPDATE daily SET steps = ? WHERE user_id = ? AND date = ?').bind(chunk, userId, date),
-    setCursor.bind(userId, settledCutoff, date),
-  ])
+  if (sameDay) {
+    // Compare-and-swap on the cursor: apply this chunk AND advance the cursor only
+    // if no concurrent writer moved the cursor since we read it (line above). A
+    // nightly full recompute (runStepsImu, the 'steps_full' job) SETs today's steps
+    // and the cursor to settledCutoff; it and this incremental 'sweep' are distinct
+    // queue jobs that aren't deduped against each other, so they CAN run together
+    // (both are enqueued by the 3:30 cron). Without the guard, a full landing
+    // between our cursor read and our slow R2 compute would let us add a stale chunk
+    // on top of the full count → double-count for the day. If the cursor moved, our
+    // chunk is stale: both statements no-op and the next sweep recomputes from the
+    // new cursor. D1 batch is one serialized transaction, so the guard is reliable.
+    await env.DB.batch([
+      env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?,?)').bind(userId, date),
+      env.DB.prepare(
+        'UPDATE daily SET steps = COALESCE(steps,0) + ? WHERE user_id = ? AND date = ? ' +
+        'AND (SELECT steps_cursor_ts FROM analytics_cursor WHERE user_id = ?) = ?',
+      ).bind(chunk, userId, date, userId, cursor),
+      env.DB.prepare(
+        'UPDATE analytics_cursor SET steps_cursor_ts = ? WHERE user_id = ? AND steps_cursor_day = ? AND steps_cursor_ts = ?',
+      ).bind(settledCutoff, userId, date, cursor),
+    ])
+  } else {
+    // Fresh day: REPLACE (not accumulate) with the full settled count, which is
+    // idempotent with a concurrent full recompute (both write the same window).
+    await env.DB.batch([
+      env.DB.prepare('INSERT OR IGNORE INTO daily(user_id, date) VALUES(?,?)').bind(userId, date),
+      env.DB.prepare('UPDATE daily SET steps = ? WHERE user_id = ? AND date = ?').bind(chunk, userId, date),
+      setCursor.bind(userId, settledCutoff, date),
+    ])
+  }
   return { added: chunk }
 }
 
