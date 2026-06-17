@@ -2,7 +2,7 @@
 // Target <50ms CPU; NEVER runs analytics inline.
 
 import type { Context } from 'hono'
-import { decodeBatch, hexToBytes } from './decode'
+import { decodeBatch, hexToBytes } from 'openstrap-protocol/ts/live'
 import { rollupMinutes } from './rollup'
 
 // ── Rate limiting: per-user token bucket in a D1 row (RESILIENCE §7). ──

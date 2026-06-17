@@ -9,7 +9,7 @@
 // ingest). We store enough to recompute averages exactly: the upsert SQL
 // folds new (sum,n) into the stored running aggregate — see ingest.ts.
 
-import type { DecodedSample } from './decode'
+import type { DecodedSample } from 'openstrap-protocol/ts/live'
 
 export interface MinuteBucket {
   ts_min: number
