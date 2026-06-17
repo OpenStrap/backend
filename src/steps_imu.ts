@@ -4,14 +4,15 @@
 // group per minute — then hands the per-minute magnitude signals to the PURE
 // AN-2554 pedometer in openstrap-analytics (calcSteps) and persists the result.
 //
-// Mirrors the runBiometrics / runRespRate pattern: decode (decode.ts) + math
-// (analytics) live elsewhere; this owns only R2 reads and the daily.steps write.
+// Mirrors the runBiometrics / runRespRate pattern: decode (openstrap-protocol) +
+// math (openstrap-analytics) live elsewhere; this owns only R2 reads and the
+// daily.steps write.
 //
 // Heavy (R2 reads) → cron / admin only, NEVER inline ingest. Owns daily.steps
 // (written AFTER analytics in the cron so it's authoritative).
 
 import { calcSteps } from 'openstrap-analytics'
-import { frameAccel, type ImuFrame } from './decode'
+import { frameAccel, type ImuFrame } from 'openstrap-protocol/ts/live'
 
 const DAY = 86400
 
