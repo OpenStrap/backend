@@ -127,10 +127,17 @@ async function computeNight(env: RespEnv, userId: string, date: string, from: nu
     }
   }
   const { resp_rate, confidence } = estimateResp(records)
-  // Always write (null + 0 conf when absent) so the gate is authoritative.
-  await env.DB.prepare(
-    'UPDATE daily SET resp_rate = ?, resp_conf = ? WHERE user_id = ? AND date = ?',
-  ).bind(resp_rate, confidence, userId, date).run()
+  // Only persist a real reading. A null pass (absent/sparse R21 — the band only
+  // emits R21 during live streaming, so most nights have none) must NOT erase a
+  // prior good night: the night is over, its resp doesn't change after the fact.
+  // A never-written night stays null by default, so the display gate
+  // (resp_conf >= 0.5) remains authoritative either way. COALESCE can't be used
+  // here because confidence is 0 (not null) when absent, which would still clobber.
+  if (resp_rate != null) {
+    await env.DB.prepare(
+      'UPDATE daily SET resp_rate = ?, resp_conf = ? WHERE user_id = ? AND date = ?',
+    ).bind(resp_rate, confidence, userId, date).run()
+  }
   return { resp_rate, confidence, r21: records.length }
 }
 
