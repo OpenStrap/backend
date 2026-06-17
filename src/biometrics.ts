@@ -188,7 +188,13 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3, onlyD
   }
   for (const { dayStart, date } of dayList) {
     const budget = Math.min(PER_DAY, TOTAL_OBJECTS - spent)
-    if (budget <= 0) { out.push({ date, rmssd: null, sdnn: null, lfhf: null, si: null, resp: null, respConf: 0, nBeats: 0, temp: null, spo2: null, rr: [] }); continue }
+    // Budget exhausted for this run: do NOT emit a null row. A null here would flow
+    // into the write loop and overwrite this day's already-computed HRV with null
+    // (the multi-day clobber bug). Skip it entirely — the day keeps its stored value
+    // and the next run (or a per-day onlyDate job, which always has full budget)
+    // recomputes it. computeWindowSteps/restingSamples are bounded per day, so
+    // multi-day runs starve the tail; skipping is the only non-destructive choice.
+    if (budget <= 0) continue
     const sl = sleepByDate.get(date)
     const from = sl ? sl.onset_ts : dayStart
     const to = sl ? sl.wake_ts + 60 : dayStart + DAY
@@ -213,7 +219,12 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3, onlyD
 
   let computed = 0
   for (const o of out) {
-    const conf = o.rmssd == null ? 0 : Math.round(Math.min(1, o.nBeats / 500) * 1000) / 1000
+    // No usable RMSSD this night → there is nothing to write that wouldn't risk
+    // erasing a previously-computed value with null. Leave the stored row untouched;
+    // a thin/empty pass must never regress a good night. (processUser owns the
+    // non-HRV daily fields, so skipping here loses nothing.)
+    if (o.rmssd == null) continue
+    const conf = Math.round(Math.min(1, o.nBeats / 500) * 1000) / 1000
     const tempIdx = (o.temp != null && blTemp != null) ? Math.round((o.temp - blTemp) * 10) / 10 : null
     const spo2Idx = (o.spo2 != null && blSpo2 != null) ? Math.round((o.spo2 - blSpo2) * 10) / 10 : null
 
@@ -255,11 +266,17 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3, onlyD
     })
     if (readiness.drivers) bioDrivers.readiness = readiness.drivers
 
+    // Measured HRV indices use COALESCE(?, col): a value computed this run wins, but
+    // a null (e.g. enough beats for RMSSD but not for LF/HF) never erases a richer
+    // prior night. Mirrors the resp_rate guard. Derived scores (recovery/readiness/
+    // stress/illness/irregular) are recomputed fresh whenever we have an RMSSD (we
+    // continue'd out of the loop otherwise), so they write directly.
     await env.DB.prepare(
-      'UPDATE daily SET recovery = ?, hrv_rmssd = ?, hrv_conf = ?, hrv_sdnn = ?, hrv_lfhf = ?, hrv_si = ?, ' +
-      'hrv_cv = ?, irregular = ?, readiness = ?, ' +
+      'UPDATE daily SET recovery = ?, hrv_rmssd = COALESCE(?, hrv_rmssd), hrv_conf = ?, ' +
+      'hrv_sdnn = COALESCE(?, hrv_sdnn), hrv_lfhf = COALESCE(?, hrv_lfhf), hrv_si = COALESCE(?, hrv_si), ' +
+      'hrv_cv = COALESCE(?, hrv_cv), irregular = ?, readiness = ?, ' +
       'resp_rate = COALESCE(?, resp_rate), resp_conf = COALESCE(?, resp_conf), ' +
-      'skin_temp_idx = ?, spo2_idx = ?, stress = ?, illness = ?, ' +
+      'skin_temp_idx = COALESCE(?, skin_temp_idx), spo2_idx = COALESCE(?, spo2_idx), stress = ?, illness = ?, ' +
       'drivers = json_patch(COALESCE(drivers, \'{}\'), ?), updated_at = ? ' +
       'WHERE user_id = ? AND date = ?',
     ).bind(
@@ -269,7 +286,7 @@ export async function runBiometrics(env: BioEnv, userId: string, days = 3, onlyD
       tempIdx, spo2Idx, JSON.stringify(stress), JSON.stringify(illness), JSON.stringify(bioDrivers), now,
       userId, o.date,
     ).run()
-    if (o.rmssd != null) computed++
+    computed++ // reached only when o.rmssd != null (we continue'd above otherwise)
   }
   return { days, computed }
 }
