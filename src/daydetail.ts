@@ -9,8 +9,9 @@
 
 import type { Context } from 'hono'
 import { cached, ttlForDate } from './cache'
+import { readMinutes } from './minute_store'
 
-type Ctx = Context<{ Bindings: { DB: D1Database }; Variables: { userId: string } }>
+type Ctx = Context<{ Bindings: { DB: D1Database; RAW_BUCKET?: R2Bucket }; Variables: { userId: string } }>
 
 const DAY = 86400
 const dayStartOf = (date: string) => Math.floor(Date.parse(`${date}T00:00:00Z`) / 1000)
@@ -36,11 +37,9 @@ const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v
 interface Min { ts_min: number; hr_avg: number | null; hr_min: number | null; hr_max: number | null; activity: number | null; wrist_on: number | null }
 
 async function loadMinutes(c: Ctx, from: number, to: number): Promise<Min[]> {
-  const { results } = await c.env.DB.prepare(
-    'SELECT ts_min, hr_avg, hr_min, hr_max, activity, wrist_on FROM minute ' +
-    'WHERE user_id = ? AND ts_min >= ? AND ts_min < ? ORDER BY ts_min ASC',
-  ).bind(c.get('userId'), from, to).all<Min>()
-  return results ?? []
+  // Tiered read: D1 for hot days, R2 fallback for sealed days (see minute_store).
+  const rows = await readMinutes(c.env, c.get('userId'), from, to)
+  return rows.map((m) => ({ ts_min: m.ts_min, hr_avg: m.hr_avg, hr_min: m.hr_min, hr_max: m.hr_max, activity: m.activity, wrist_on: m.wrist_on }))
 }
 
 async function loadHr(c: Ctx): Promise<{ rhr: number; maxHr: number }> {
