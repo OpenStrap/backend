@@ -6,6 +6,7 @@ import { runAnalytics, processUser } from './analytics'
 import { ingestBatch, ingestEvents } from './ingest'
 import { handleQueueBatch, type AnalyticsMessage, type AnalyticsJob } from './queue'
 import { runWakeLadder, retryStaleCloses } from './wake_cron'
+import { sealOldDays } from './minute_store'
 import { getToday, getSleep, getSleepV2, getStrain, getSessions, getTrends, getChart } from './query'
 import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
@@ -462,8 +463,12 @@ export default {
       try { await autoCloseStaleWorkouts(env.DB) } catch (e) { console.error('autoclose failed', e) }
       // EVERY tick — wake detection only (the cron's sole job).
       try { await runWakeLadder(env) } catch (e) { console.error('wake ladder failed', e) }
-      // Nightly maintenance ONLY (separate from detection): retention + retry-net.
+      // Nightly maintenance ONLY (separate from detection): seal + retention + retry-net.
       if (event.cron === '30 3 * * *') {
+        // Seal days older than the hot window to gzipped R2 objects and drop them from
+        // D1 (D1-hot / R2-sealed tiering — cuts D1 storage + per-row prune-deletes).
+        try { await sealOldDays(env) } catch (e) { console.error('seal failed', e) }
+        // Backstop: clear any minute/events still unsealed past retention (e.g. no bucket).
         const cutoff = Math.floor(Date.now() / 1000) - MINUTE_RETENTION_DAYS * DAY
         await env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
         await env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(cutoff).run()
