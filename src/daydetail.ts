@@ -127,6 +127,8 @@ const safe = (s: any) => { try { return JSON.parse(s) } catch { return null } }
 export async function getDayWear(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId')
+  const payload = await cached(c.env.DB, userId, `daywear:${date}`, ttlForDate(date), async () => {
   const start = dayStartOf(date)
   const mins = await loadMinutes(c, start, start + DAY)
 
@@ -165,10 +167,10 @@ export async function getDayWear(c: Ctx) {
   // Prefer the derived daily.wear_min when present (same source), else the live count.
   const dr = await c.env.DB.prepare(
     'SELECT wear_min FROM daily WHERE user_id = ? AND date = ?',
-  ).bind(c.get('userId'), date).first<{ wear_min: number | null }>()
+  ).bind(userId, date).first<{ wear_min: number | null }>()
   const wearMin = dr?.wear_min != null ? Math.round(dr.wear_min) : wornMin
 
-  return c.json({
+  return {
     date,
     worn_min: wearMin,
     coverage_pct: Math.round((wearMin / 1440) * 100),
@@ -178,7 +180,9 @@ export async function getDayWear(c: Ctx) {
     segments,                                 // number of separate on-wrist stretches
     longest_off_min: longestGap,              // longest off-wrist gap inside the worn window
     tier: 'AUTH',                             // straight from the device's wrist sensor
+  }
   })
+  return c.json(payload)
 }
 
 // ── /day/sleep ───────────────────────────────────────────────────────────────
@@ -344,6 +348,8 @@ export async function getDayStress(c: Ctx) {
 export async function getDayTimeline(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId')
+  const payload = await cached(c.env.DB, userId, `daytimeline:${date}`, ttlForDate(date), async () => {
   const start = dayStartOf(date)
   const end = start + DAY
   const mins = await loadMinutes(c, start, end)
@@ -369,9 +375,9 @@ export async function getDayTimeline(c: Ctx) {
   ).bind(c.get('userId'), start, end).all<any>()
   const { results: events } = await c.env.DB.prepare(
     'SELECT event_id, ts FROM events WHERE user_id = ? AND ts >= ? AND ts < ? ORDER BY ts ASC',
-  ).bind(c.get('userId'), start, end).all<any>()
+  ).bind(userId, start, end).all<any>()
 
-  return c.json({
+  return {
     date,
     day_start: start,
     hr: downsample(hr),
@@ -383,7 +389,9 @@ export async function getDayTimeline(c: Ctx) {
       peak_hr: peak.v ? peak : null,
       low_hr: low.v ? low : null,
     },
+  }
   })
+  return c.json(payload)
 }
 
 // ── /day/heart ─────────────────────────────────────────────────────────────
