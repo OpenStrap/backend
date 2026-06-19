@@ -13,7 +13,7 @@
 // MAX, rr = longer blob), so a re-uploaded batch can't double-count and a fuller
 // batch wins.
 
-import { calcSteps } from 'openstrap-analytics'
+import { calcSteps, cleanRr } from 'openstrap-analytics'
 import { frameAccel, hexToBytes, realtimeRr } from 'openstrap-protocol/ts/live'
 import { parse_r24 } from 'openstrap-protocol/ts/records'
 
@@ -40,21 +40,20 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
       if (r && r.ts_epoch > 0) {
         const m = Math.floor(r.ts_epoch / 60) * 60
         const arr = rrByMin.get(m) ?? []
-        for (const v of r.rr_intervals_ms) if (v >= 300 && v <= 2000) arr.push(v)
+        for (const v of r.rr_intervals_ms) arr.push(v) // raw; gated by analytics cleanRr below
         rrByMin.set(m, arr)
       }
       continue
     }
 
-    // [v2] LIVE RR — un-banned: RR unit confirmed ms (cross-validated vs noop/Strand).
-    // 0x28 compact HR + R10 carry beat-to-beat intervals; collect them with the SAME
-    // 300–2000 ms physiological gate as R24, so an unvalidated 0x28 offset can only
-    // drop values, never store a bogus interval. (R10 also feeds accel below.)
+    // LIVE RR (un-banned: unit confirmed ms, cross-validated vs noop/Strand). 0x28
+    // compact HR + R10 carry beat-to-beat intervals; gated by analytics cleanRr below,
+    // so an unvalidated 0x28 offset can only drop values, never store a bogus interval.
     const rr = realtimeRr(hex)
     if (rr) {
       const m = Math.floor(rr.ts / 60) * 60
       const arr = rrByMin.get(m) ?? []
-      for (const v of rr.rr_ms) if (v >= 300 && v <= 2000) arr.push(v)
+      for (const v of rr.rr_ms) arr.push(v) // raw; cleaned below
       rrByMin.set(m, arr)
     }
 
@@ -79,7 +78,9 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
       for (const fr of ordered) for (const v of fr.mags) sig.push(v)
       steps = calcSteps([sig])
     }
-    out.set(m, { steps, rr: rrByMin.get(m) ?? [] })
+    // Single library gate (300–2000 ms + ectopic |Δ|>200ms drop) — logic lives in
+    // analytics, not duplicated here.
+    out.set(m, { steps, rr: cleanRr(rrByMin.get(m) ?? []) })
   }
   return out
 }

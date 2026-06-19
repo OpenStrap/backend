@@ -5,6 +5,7 @@ import {
 import { runAnalytics, processUser } from './analytics'
 import { ingestBatch, ingestEvents } from './ingest'
 import { handleQueueBatch, type AnalyticsMessage, type AnalyticsJob } from './queue'
+import { runWakeLadder, retryStaleCloses } from './wake_cron'
 import { getToday, getSleep, getSleepV2, getStrain, getSessions, getTrends, getChart } from './query'
 import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
@@ -450,89 +451,24 @@ export default {
     await handleQueueBatch(batch, env)
   },
 
-  // Crons: "*/30 * * * *" sweep (enqueue dirty users); "30 3 * * *" nightly full
-  // re-derive + R2 jobs + prune. With Queues bound, the cron only ENQUEUES; the
-  // consumer does the bounded per-user work. Inline fallback if the binding is absent.
+  // [feat/wake-trigger] The frequent cron does ONE thing: the isUserAwake ladder
+  // (wake_cron.runWakeLadder) — detect each user's real wake and fire ONE close_day
+  // per physiological day. Cheap enough for */10 (awake-and-closed users = a cursor
+  // read; asleep = a 30-min peek; the heavy ensemble runs once, at the wake). All
+  // derivation lives in the close_day QUEUE job, never here. A SEPARATE nightly tick
+  // does maintenance only: prune aged minute/events + a retry-net for missed closes.
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext): Promise<void> {
-    if (event.cron === '30 3 * * *') {
-      ctx.waitUntil((async () => {
-        const since2 = new Date(Date.now() - 2 * DAY * 1000).toISOString().slice(0, 10)
-        const since3 = new Date(Date.now() - 3 * DAY * 1000).toISOString().slice(0, 10)
-        if (env.ANALYTICS_Q) {
-          // Fan out per (user, job): each consumer invocation = one bounded unit.
-          const dailyU = (await env.DB.prepare('SELECT DISTINCT user_id FROM daily WHERE date >= ?')
-            .bind(since3).all<{ user_id: string }>()).results ?? []
-          const ids = dailyU.map((u) => u.user_id)
-          // 'sweep' = one per user (D1 + incremental steps, light). 'steps_full' =
-          // late-frame true-up, per (user, day).
-          await enqueueJobs(env.ANALYTICS_Q, ids, 'sweep')
-          await enqueueJobDays(env.ANALYTICS_Q, ids, 'steps_full', lastNDates(2))
-          // Biometrics + resp are the expensive R2 re-decodes. Enqueue ONLY the
-          // (user, day) nights still MISSING the metric in the last 2 days — this
-          // skips every already-scored night (no redundant decode vs the
-          // event-driven fire) AND retries nights the event fire left null
-          // (self-healing). The single biggest R2 cost saver.
-          const bioNeed = (await env.DB.prepare(
-            'SELECT user_id, date FROM daily WHERE date >= ? AND hrv_rmssd IS NULL',
-          ).bind(since2).all<{ user_id: string; date: string }>()).results ?? []
-          await sendChunked(env.ANALYTICS_Q,
-            bioNeed.map((r) => ({ body: { user_id: r.user_id, job: 'biometrics', day: r.date } as AnalyticsMessage })))
-          const respNeed = (await env.DB.prepare(
-            'SELECT d.user_id, d.date FROM daily d WHERE d.date >= ? AND d.resp_rate IS NULL ' +
-            'AND EXISTS (SELECT 1 FROM sleep s WHERE s.user_id = d.user_id AND s.date = d.date AND s.onset_ts IS NOT NULL)',
-          ).bind(since2).all<{ user_id: string; date: string }>()).results ?? []
-          await sendChunked(env.ANALYTICS_Q,
-            respNeed.map((r) => ({ body: { user_id: r.user_id, job: 'resp', day: r.date } as AnalyticsMessage })))
-        } else {
-          // Fallback (no queue): inline. Only viable at small scale.
-          await runAnalytics(env.DB, { historyDays: 2 })
-          try {
-            const u = (await env.DB.prepare('SELECT DISTINCT user_id FROM sleep WHERE date >= ? AND onset_ts IS NOT NULL').bind(since2).all<{ user_id: string }>()).results ?? []
-            for (const x of u) await runRespRate(env, x.user_id, 2)
-          } catch (e) { console.error('resp cron failed', e) }
-          try {
-            const u = (await env.DB.prepare('SELECT DISTINCT user_id FROM daily WHERE date >= ?').bind(since3).all<{ user_id: string }>()).results ?? []
-            for (const x of u) await runBiometrics(env, x.user_id, 3)
-          } catch (e) { console.error('biometrics cron failed', e) }
-          try {
-            const u = (await env.DB.prepare('SELECT DISTINCT user_id FROM daily WHERE date >= ?').bind(since2).all<{ user_id: string }>()).results ?? []
-            for (const x of u) await runStepsImu(env, x.user_id, 2)
-          } catch (e) { console.error('steps cron failed', e) }
-        }
-        // Prune is light D1 — always inline. Minute + events share the same
-        // drill-down window (/day/timeline), so they age out together.
+    ctx.waitUntil((async () => {
+      try { await autoCloseStaleWorkouts(env.DB) } catch (e) { console.error('autoclose failed', e) }
+      // EVERY tick — wake detection only (the cron's sole job).
+      try { await runWakeLadder(env) } catch (e) { console.error('wake ladder failed', e) }
+      // Nightly maintenance ONLY (separate from detection): retention + retry-net.
+      if (event.cron === '30 3 * * *') {
         const cutoff = Math.floor(Date.now() / 1000) - MINUTE_RETENTION_DAYS * DAY
         await env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
         await env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(cutoff).run()
-      })())
-    } else {
-      ctx.waitUntil((async () => {
-        await autoCloseStaleWorkouts(env.DB)
-        if (env.ANALYTICS_Q) {
-          // Enqueue a 'sweep' (processUser + incremental steps) per dirty user.
-          const dirty = (await env.DB.prepare('SELECT user_id FROM analytics_cursor WHERE dirty = 1')
-            .all<{ user_id: string }>()).results ?? []
-          const dids = dirty.map((u) => u.user_id)
-          await enqueueJobs(env.ANALYTICS_Q, dids, 'sweep')
-          // Optimistically clear dirty for exactly the users we enqueued, so a
-          // persistently-failing sweep isn't re-enqueued every 30 min (a user
-          // re-dirtied after this SELECT keeps dirty=1 and is caught next tick).
-          for (let i = 0; i < dids.length; i += 100) {
-            const chunk = dids.slice(i, i + 100)
-            await env.DB.prepare(
-              `UPDATE analytics_cursor SET dirty = 0 WHERE user_id IN (${chunk.map(() => '?').join(',')})`,
-            ).bind(...chunk).run()
-          }
-        } else {
-          // Fallback (no queue): inline.
-          await runAnalytics(env.DB, { historyDays: 3 })
-          try {
-            const since = Math.floor(Date.now() / 1000) - 2 * 3600
-            const u = (await env.DB.prepare('SELECT DISTINCT user_id FROM minute WHERE ts_min >= ?').bind(since).all<{ user_id: string }>()).results ?? []
-            for (const x of u) await runStepsIncremental(env, x.user_id)
-          } catch (e) { console.error('steps incremental cron failed', e) }
-        }
-      })())
-    }
+        try { await retryStaleCloses(env) } catch (e) { console.error('retry-net failed', e) }
+      }
+    })())
   },
 }
