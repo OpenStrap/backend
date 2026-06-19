@@ -15,6 +15,7 @@ import {
   type Minute, type Profile, type Baseline, type DayHistory,
   type DailyStrain, type NightSummary, type SleepValue, type Metric, type Driver,
 } from 'openstrap-analytics'
+import { readMinutes } from './minute_store'
 
 const DAY = 86400
 
@@ -79,11 +80,10 @@ export async function loadBaseline(db: D1Database, userId: string): Promise<Load
 }
 
 export async function loadMinutes(db: D1Database, userId: string, from: number, to: number): Promise<Minute[]> {
-  const { results } = await db.prepare(
-    'SELECT ts_min, hr_avg, hr_min, hr_max, hr_n, activity, steps, wrist_on FROM minute ' +
-    'WHERE user_id = ? AND ts_min >= ? AND ts_min < ? ORDER BY ts_min ASC',
-  ).bind(userId, from, to).all<MinuteRow>()
-  return (results ?? []).map(toMinute)
+  // Day-packed store. processUser/wake windows are within HOT_DAYS → all in D1
+  // minute_day (RAW_BUCKET omitted = no R2 fallback needed for hot reads).
+  const recs = await readMinutes({ DB: db }, userId, from, to)
+  return recs.map(toMinute)
 }
 
 // Sleep search window for the night that WAKES on `dateDayStart`:

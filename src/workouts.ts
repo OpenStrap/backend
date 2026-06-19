@@ -8,6 +8,7 @@ import {
   calcStrain, calcHrZones, calcCalories, calcHrRecovery,
   type Minute, type Profile, type Baseline,
 } from 'openstrap-analytics'
+import { readMinutes } from './minute_store'
 
 type Ctx = Context<{ Bindings: { DB: D1Database }; Variables: { userId: string } }>
 const nowSec = () => Math.floor(Date.now() / 1000)
@@ -34,13 +35,11 @@ async function loadBaseline(db: D1Database, userId: string): Promise<Baseline> {
   }
 }
 async function loadMinutes(db: D1Database, userId: string, from: number, to: number): Promise<Minute[]> {
-  const { results } = await db.prepare(
-    'SELECT ts_min, hr_avg, hr_min, hr_max, hr_n, activity, steps, wrist_on FROM minute ' +
-    'WHERE user_id = ? AND ts_min >= ? AND ts_min <= ? ORDER BY ts_min ASC',
-  ).bind(userId, from, to).all<any>()
-  return (results ?? []).map((r: any) => ({
-    ts: r.ts_min, hr_avg: r.hr_avg ?? 0, hr_min: r.hr_min ?? 0, hr_max: r.hr_max ?? 0,
-    hr_n: r.hr_n ?? 0, activity: r.activity ?? 0, steps: r.steps ?? 0, wrist_on: !!r.wrist_on,
+  // Day-packed store. Only ever called at workout-end (recent/hot) → D1 minute_day.
+  const recs = await readMinutes({ DB: db }, userId, from, to)
+  return recs.map((r) => ({
+    ts: r.ts_min, hr_avg: r.hr_avg, hr_min: r.hr_min, hr_max: r.hr_max,
+    hr_n: r.hr_n, activity: r.activity, steps: r.steps, wrist_on: !!r.wrist_on,
   }))
 }
 

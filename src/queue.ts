@@ -74,7 +74,7 @@ async function runJob(env: QueueEnv, userId: string, job: AnalyticsJob, day?: st
       await runStepsIncremental(env, userId)
       if (day && wake_ts) {
         const from = onset_ts ?? (wake_ts - 8 * 3600)
-        try { await runBiometricsMinute({ DB: env.DB }, userId, day, from, wake_ts + 60) } catch (e) { console.error('biometrics_minute failed', userId, day, e) }
+        try { await runBiometricsMinute({ DB: env.DB, RAW_BUCKET: env.RAW_BUCKET }, userId, day, from, wake_ts + 60) } catch (e) { console.error('biometrics_minute failed', userId, day, e) }
         await invalidateDay(env.DB, userId, day)
       }
       await env.DB.prepare('UPDATE analytics_cursor SET dirty = 0 WHERE user_id = ?').bind(userId).run()

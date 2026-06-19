@@ -6,7 +6,7 @@ import { runAnalytics, processUser } from './analytics'
 import { ingestBatch, ingestEvents } from './ingest'
 import { handleQueueBatch, type AnalyticsMessage, type AnalyticsJob } from './queue'
 import { runWakeLadder, retryStaleCloses } from './wake_cron'
-import { sealOldDays } from './minute_store'
+import { sealOldDays, pruneMinuteDays } from './minute_store'
 import { getToday, getSleep, getSleepV2, getStrain, getSessions, getTrends, getChart } from './query'
 import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
@@ -410,10 +410,10 @@ app.post('/admin/wipe-raw', async (c) => {
 
 // Prune minute rows older than 90 days (raw stays in R2).
 app.post('/admin/prune', async (c) => {
-  const cutoff = Math.floor(Date.now() / 1000) - MINUTE_RETENTION_DAYS * DAY
-  const res = await c.env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
-  const ev = await c.env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(cutoff).run()
-  return c.json({ ok: true, deleted: res.meta?.changes ?? 0, events_deleted: ev.meta?.changes ?? 0, cutoff })
+  const now = Math.floor(Date.now() / 1000)
+  await pruneMinuteDays(c.env, now, MINUTE_RETENTION_DAYS) // day-packed minute_day rows
+  const ev = await c.env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(now - MINUTE_RETENTION_DAYS * DAY).run()
+  return c.json({ ok: true, events_deleted: ev.meta?.changes ?? 0 })
 })
 
 // Send messages in sendBatch chunks of 100 (the Queues per-call max), so the cron
@@ -468,10 +468,10 @@ export default {
         // Seal days older than the hot window to gzipped R2 objects and drop them from
         // D1 (D1-hot / R2-sealed tiering — cuts D1 storage + per-row prune-deletes).
         try { await sealOldDays(env) } catch (e) { console.error('seal failed', e) }
-        // Backstop: clear any minute/events still unsealed past retention (e.g. no bucket).
-        const cutoff = Math.floor(Date.now() / 1000) - MINUTE_RETENTION_DAYS * DAY
-        await env.DB.prepare('DELETE FROM minute WHERE ts_min < ?').bind(cutoff).run()
-        await env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(cutoff).run()
+        // Backstop: clear any minute_day/events still unsealed past retention (e.g. no bucket).
+        const nowS = Math.floor(Date.now() / 1000)
+        await pruneMinuteDays(env, nowS, MINUTE_RETENTION_DAYS)
+        await env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(nowS - MINUTE_RETENTION_DAYS * DAY).run()
         try { await retryStaleCloses(env) } catch (e) { console.error('retry-net failed', e) }
       }
     })())

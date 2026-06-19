@@ -4,8 +4,9 @@
 
 import type { Context } from 'hono'
 import { calcFitnessTrend, type DayHistory } from 'openstrap-analytics'
+import { readMinutes, latestMinute } from './minute_store'
 
-type Ctx = Context<{ Bindings: { DB: D1Database }; Variables: { userId: string } }>
+type Ctx = Context<{ Bindings: { DB: D1Database; RAW_BUCKET?: R2Bucket }; Variables: { userId: string } }>
 
 const nowSec = () => Math.floor(Date.now() / 1000)
 const todayDate = () => new Date().toISOString().slice(0, 10)
@@ -43,10 +44,8 @@ export async function getToday(c: Ctx) {
   const u = await c.env.DB.prepare('SELECT step_goal FROM users WHERE id = ?')
     .bind(userId).first<any>()
 
-  // Live status: most recent minute (HR + worn) in the last 10 minutes.
-  const live = await c.env.DB.prepare(
-    'SELECT ts_min, hr_avg, wrist_on FROM minute WHERE user_id = ? AND ts_min >= ? ORDER BY ts_min DESC LIMIT 1',
-  ).bind(userId, nowSec() - 600).first<any>()
+  // Live status: most recent minute (HR + worn) in the last 10 minutes (day-packed store).
+  const live = await latestMinute(c.env, userId, nowSec() - 600, nowSec())
 
   const df = parseFlags(daily?.flags)
   const sf = parseFlags(sleep?.flags)
@@ -354,10 +353,8 @@ export async function getChart(c: Ctx) {
           ? 'steps'
           : 'hr_avg'
 
-  const { results } = await c.env.DB.prepare(
-    `SELECT ts_min, ${col} AS v, wrist_on FROM minute WHERE user_id = ? AND ts_min >= ? AND ts_min <= ? ORDER BY ts_min ASC`,
-  ).bind(userId, from, to).all<{ ts_min: number; v: number | null; wrist_on: number }>()
-  const rows = results ?? []
+  const recs = await readMinutes(c.env, userId, from, to)
+  const rows = recs.map((r) => ({ ts_min: r.ts_min, v: (r as any)[col] as number | null, wrist_on: r.wrist_on }))
 
   const MAX = 500
   let points: { ts: number; v: number | null }[]

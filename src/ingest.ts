@@ -4,7 +4,8 @@
 import type { Context } from 'hono'
 import { decodeBatch, hexToBytes } from 'openstrap-protocol/ts/live'
 import { rollupMinutes } from './rollup'
-import { perMinuteSignals, encodeRr } from './ingest_signals'
+import { perMinuteSignals } from './ingest_signals'
+import { writeBatch } from './minute_store'
 
 // ── Rate limiting: per-user token bucket in a D1 row (RESILIENCE §7). ──
 // Refill RATE tokens/sec, cap BURST. One ingest = one token. Over budget → 429.
@@ -86,48 +87,18 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
     }
   }
 
-  // 4. Rollup → minute upsert (one batch). Merge deterministically with stored.
+  // 4. Rollup → day-packed minute store (ONE row per day, read-merge-write). This is
+    // the cost lever: ~1 row written/day instead of ~1,440. The merge inside writeBatch
+    // mirrors the old per-minute ON CONFLICT exactly (additive sums, CASE hr_min, MAX
+    // hr_max, steps add, rr longer-wins). Idempotent IFF the edge dedupes by hex (it does).
+    // RR (ms, R24 + live 0x28/R10) rides the blob as number[] — HRV folds into the
+    // wake-close with zero R2. (Storage: gzipped blob via bound param — well under D1's
+    // 2 MB value cap; serialized outside the 100 KB SQL-statement limit.)
   const buckets = rollupMinutes(samples)
   let minutesWritten = 0
-  let maxTsMin = 0
   if (buckets.length > 0) {
-    // The upsert folds new running sums into stored aggregates and recomputes
-    // the display columns (hr_avg, activity, hr_min/max) from the merged totals.
-    // [wake-trigger] per-minute RR (ms) decoded from this batch's frames (R24 + live
-    // 0x28/R10), so HRV folds into the wake-close with zero R2. We use ONLY the `rr`
-    // here; steps stay on the existing rollup path (no step-semantics change this phase).
     const sig = perMinuteSignals(records)
-    const stmt = c.env.DB.prepare(
-      'INSERT INTO minute (user_id, ts_min, hr_avg, hr_min, hr_max, hr_n, hr_sum, activity, act_sum, act_n, steps, wrist_on, rr) ' +
-      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
-      'ON CONFLICT(user_id, ts_min) DO UPDATE SET ' +
-      'hr_sum = minute.hr_sum + excluded.hr_sum, ' +
-      'hr_n = minute.hr_n + excluded.hr_n, ' +
-      'hr_min = CASE WHEN minute.hr_min = 0 THEN excluded.hr_min ' +
-      '              WHEN excluded.hr_min = 0 THEN minute.hr_min ' +
-      '              ELSE MIN(minute.hr_min, excluded.hr_min) END, ' +
-      'hr_max = MAX(minute.hr_max, excluded.hr_max), ' +
-      'hr_avg = CASE WHEN (minute.hr_n + excluded.hr_n) > 0 ' +
-      '              THEN (minute.hr_sum + excluded.hr_sum) / (minute.hr_n + excluded.hr_n) ELSE 0 END, ' +
-      'act_sum = minute.act_sum + excluded.act_sum, ' +
-      'act_n = minute.act_n + excluded.act_n, ' +
-      'activity = CASE WHEN (minute.act_n + excluded.act_n) > 0 ' +
-      '                THEN (minute.act_sum + excluded.act_sum) / (minute.act_n + excluded.act_n) ELSE 0 END, ' +
-      'steps = minute.steps + excluded.steps, ' +
-      // RR: keep the fuller blob (idempotent — a re-uploaded/fuller batch wins; never doubles).
-      "rr = CASE WHEN excluded.rr IS NOT NULL AND length(excluded.rr) >= length(COALESCE(minute.rr, x'')) " +
-      '         THEN excluded.rr ELSE minute.rr END, ' +
-      'wrist_on = MAX(minute.wrist_on, excluded.wrist_on)',
-    )
-    const batch = buckets.map((b) => {
-      if (b.ts_min > maxTsMin) maxTsMin = b.ts_min
-      const hr_avg = b.hr_n > 0 ? Math.round(b.hr_sum / b.hr_n) : 0
-      const activity = b.act_n > 0 ? b.act_sum / b.act_n : 0
-      const rrBlob = encodeRr(sig.get(b.ts_min)?.rr ?? [])
-      return stmt.bind(userId, b.ts_min, hr_avg, b.hr_min, b.hr_max, b.hr_n, b.hr_sum,
-        activity, b.act_sum, b.act_n, b.steps, b.wrist_on, rrBlob)
-    })
-    await c.env.DB.batch(batch)
+    await writeBatch(c.env, userId, buckets, sig, Math.floor(Date.now() / 1000))
     minutesWritten = buckets.length
   }
 

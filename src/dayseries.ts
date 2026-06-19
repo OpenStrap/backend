@@ -1,27 +1,19 @@
-// dayseries.ts — minimal D1-only RR loader for the HRV-from-minute path.
+// dayseries.ts — RR loader for the HRV-from-minute path.
 //
-// [feat/wake-trigger] Deliberately the *minimal* version: reads beat-to-beat RR
-// straight from the D1 `minute.rr` BLOB column (populated at ingest by
-// ingest_signals). NO R2 series cache / re-decode (that v3 machinery is left
-// behind on purpose). HRV/recovery therefore costs zero R2 ops — it folds into the
-// wake-triggered day-close. Returns a per-minute map keyed by ts_min.
+// [feat/wake-trigger] RR now rides the day-packed minute blob (minute_store) as a
+// plain number[] per minute — no separate column, no per-blob decode. Reads via the
+// tiered store (D1 hot + R2 sealed), so HRV at the wake-close still costs zero extra
+// R2 for hot nights. Returns RR (ms) per minute over [from, to].
 
-import { decodeRr } from './ingest_signals'
+import { readMinutes, type StoreEnv } from './minute_store'
 
-interface DSEnv { DB: D1Database; RAW_BUCKET?: R2Bucket; MINUTE_SOURCE?: string }
-
-/** RR (ms) per minute over [from, to] from D1 minute.rr. Empty map if none. */
+/** RR (ms) per minute over [from, to] from the day-packed store. Empty if none. */
 export async function loadDayRr(
-  env: DSEnv, userId: string, from: number, to: number,
+  env: StoreEnv, userId: string, from: number, to: number,
 ): Promise<Map<number, number[]>> {
-  const fromMin = Math.floor(from / 60) * 60
-  const { results } = await env.DB.prepare(
-    'SELECT ts_min, rr FROM minute WHERE user_id = ? AND ts_min >= ? AND ts_min <= ? AND rr IS NOT NULL ORDER BY ts_min',
-  ).bind(userId, fromMin, to).all<{ ts_min: number; rr: ArrayBuffer | null }>()
   const map = new Map<number, number[]>()
-  for (const r of results ?? []) {
-    const rr = decodeRr(r.rr)
-    if (rr.length) map.set(r.ts_min, rr)
+  for (const m of await readMinutes(env, userId, from, to)) {
+    if (m.rr && m.rr.length) map.set(m.ts_min, m.rr)
   }
   return map
 }
