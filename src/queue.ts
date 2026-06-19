@@ -6,16 +6,20 @@
 
 import { processUser } from './analytics'
 import { runBiometrics } from './biometrics'
+import { runBiometricsMinute } from './biometrics_minute'
 import { runRespRate } from './resp'
 import { runStepsImu, runStepsIncremental } from './steps_imu'
+import { invalidateDay } from './cache'
 
-export type AnalyticsJob = 'sweep' | 'biometrics' | 'resp' | 'steps_full'
+export type AnalyticsJob = 'sweep' | 'biometrics' | 'resp' | 'steps_full' | 'close_day'
 
 export interface AnalyticsMessage {
   user_id: string
   upto?: number
   job?: AnalyticsJob // default 'sweep'
   day?: string       // YYYY-MM-DD — per-(user,day) fan-out for heavy R2 jobs
+  onset_ts?: number  // [wake-trigger] close_day: sleep onset (RR window start)
+  wake_ts?: number   // [wake-trigger] close_day: wake (RR window end)
 }
 
 interface QueueEnv {
@@ -58,8 +62,23 @@ async function maybeTriggerBiometrics(env: QueueEnv, userId: string): Promise<vo
 
 // Run one bounded unit of work. Each branch is sized to fit in a single
 // invocation's budget (one user, one job, a few days of R2 at most).
-async function runJob(env: QueueEnv, userId: string, job: AnalyticsJob, day?: string): Promise<void> {
+async function runJob(env: QueueEnv, userId: string, job: AnalyticsJob, day?: string, onset_ts?: number, wake_ts?: number): Promise<void> {
   switch (job) {
+    case 'close_day':
+      // [wake-trigger] fired ONCE per physiological day when the user wakes. Derives
+      // the day (sleep/naps/strain/sessions/baselines/coach via processUser) and folds
+      // in HRV/recovery from D1 minute.rr — zero R2. Then invalidates the day's Tier-2
+      // cache and clears the dirty flag (daytime ingests re-set it; the cron skips
+      // awake-and-closed users by last_close_date, so no churn).
+      await processUser(env.DB, userId, { historyDays: 3 })
+      await runStepsIncremental(env, userId)
+      if (day && wake_ts) {
+        const from = onset_ts ?? (wake_ts - 8 * 3600)
+        try { await runBiometricsMinute({ DB: env.DB }, userId, day, from, wake_ts + 60) } catch (e) { console.error('biometrics_minute failed', userId, day, e) }
+        await invalidateDay(env.DB, userId, day)
+      }
+      await env.DB.prepare('UPDATE analytics_cursor SET dirty = 0 WHERE user_id = ?').bind(userId).run()
+      break
     case 'biometrics':
       // HRV/temp/SpO₂ from RR (R2) for ONE day (day set) or the trailing window.
       await runBiometrics(env, userId, 3, day)
@@ -104,8 +123,9 @@ export async function handleQueueBatch(
     const uid = msgs[0].body.user_id
     const job = msgs[0].body.job ?? 'sweep'
     const day = msgs[0].body.day
+    const { onset_ts, wake_ts } = msgs[0].body
     try {
-      await runJob(env, uid, job, day)
+      await runJob(env, uid, job, day, onset_ts, wake_ts)
       for (const m of msgs) m.ack()
     } catch (e) {
       console.error('queue: job failed', uid, job, day, e)

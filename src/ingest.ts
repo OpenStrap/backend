@@ -4,6 +4,7 @@
 import type { Context } from 'hono'
 import { decodeBatch, hexToBytes } from 'openstrap-protocol/ts/live'
 import { rollupMinutes } from './rollup'
+import { perMinuteSignals, encodeRr } from './ingest_signals'
 
 // ── Rate limiting: per-user token bucket in a D1 row (RESILIENCE §7). ──
 // Refill RATE tokens/sec, cap BURST. One ingest = one token. Over budget → 429.
@@ -92,9 +93,13 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
   if (buckets.length > 0) {
     // The upsert folds new running sums into stored aggregates and recomputes
     // the display columns (hr_avg, activity, hr_min/max) from the merged totals.
+    // [wake-trigger] per-minute RR (ms) decoded from this batch's frames (R24 + live
+    // 0x28/R10), so HRV folds into the wake-close with zero R2. We use ONLY the `rr`
+    // here; steps stay on the existing rollup path (no step-semantics change this phase).
+    const sig = perMinuteSignals(records)
     const stmt = c.env.DB.prepare(
-      'INSERT INTO minute (user_id, ts_min, hr_avg, hr_min, hr_max, hr_n, hr_sum, activity, act_sum, act_n, steps, wrist_on) ' +
-      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ' +
+      'INSERT INTO minute (user_id, ts_min, hr_avg, hr_min, hr_max, hr_n, hr_sum, activity, act_sum, act_n, steps, wrist_on, rr) ' +
+      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ' +
       'ON CONFLICT(user_id, ts_min) DO UPDATE SET ' +
       'hr_sum = minute.hr_sum + excluded.hr_sum, ' +
       'hr_n = minute.hr_n + excluded.hr_n, ' +
@@ -109,14 +114,18 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
       'activity = CASE WHEN (minute.act_n + excluded.act_n) > 0 ' +
       '                THEN (minute.act_sum + excluded.act_sum) / (minute.act_n + excluded.act_n) ELSE 0 END, ' +
       'steps = minute.steps + excluded.steps, ' +
+      // RR: keep the fuller blob (idempotent — a re-uploaded/fuller batch wins; never doubles).
+      "rr = CASE WHEN excluded.rr IS NOT NULL AND length(excluded.rr) >= length(COALESCE(minute.rr, x'')) " +
+      '         THEN excluded.rr ELSE minute.rr END, ' +
       'wrist_on = MAX(minute.wrist_on, excluded.wrist_on)',
     )
     const batch = buckets.map((b) => {
       if (b.ts_min > maxTsMin) maxTsMin = b.ts_min
       const hr_avg = b.hr_n > 0 ? Math.round(b.hr_sum / b.hr_n) : 0
       const activity = b.act_n > 0 ? b.act_sum / b.act_n : 0
+      const rrBlob = encodeRr(sig.get(b.ts_min)?.rr ?? [])
       return stmt.bind(userId, b.ts_min, hr_avg, b.hr_min, b.hr_max, b.hr_n, b.hr_sum,
-        activity, b.act_sum, b.act_n, b.steps, b.wrist_on)
+        activity, b.act_sum, b.act_n, b.steps, b.wrist_on, rrBlob)
     })
     await c.env.DB.batch(batch)
     minutesWritten = buckets.length

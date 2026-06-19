@@ -63,7 +63,7 @@ async function loadProfile(db: D1Database, userId: string): Promise<Profile> {
 
 type LoadedBaseline = Baseline & { sleeping_hr: number | null; resp_rate: number | null }
 
-async function loadBaseline(db: D1Database, userId: string): Promise<LoadedBaseline> {
+export async function loadBaseline(db: D1Database, userId: string): Promise<LoadedBaseline> {
   const b = await db.prepare(
     'SELECT resting_hr, max_hr, sleep_need_min, skin_temp, chronic_strain, sleeping_hr, resp_rate FROM baselines WHERE user_id = ?',
   ).bind(userId).first<any>()
@@ -78,7 +78,7 @@ async function loadBaseline(db: D1Database, userId: string): Promise<LoadedBasel
   }
 }
 
-async function loadMinutes(db: D1Database, userId: string, from: number, to: number): Promise<Minute[]> {
+export async function loadMinutes(db: D1Database, userId: string, from: number, to: number): Promise<Minute[]> {
   const { results } = await db.prepare(
     'SELECT ts_min, hr_avg, hr_min, hr_max, hr_n, activity, steps, wrist_on FROM minute ' +
     'WHERE user_id = ? AND ts_min >= ? AND ts_min < ? ORDER BY ts_min ASC',
