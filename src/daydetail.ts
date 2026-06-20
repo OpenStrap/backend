@@ -91,9 +91,17 @@ export async function getDayStrain(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
   const start = dayStartOf(date)
+  const isToday = date === new Date().toISOString().slice(0, 10)
   // For today, refresh auto-detected sessions on read (throttled) so the day's
   // workout list isn't stale until the next wake-close.
-  if (date === new Date().toISOString().slice(0, 10)) await ensureTodayWorkouts(c.env.DB, c.get('userId'))
+  if (isToday) await ensureTodayWorkouts(c.env.DB, c.get('userId'))
+  // Steps (AN-2554): live SUM of today's minute.steps; past days use the stored
+  // daily.steps (persisted by processUser at close). Zero R2 — hot day blob.
+  let liveSteps: number | null = null
+  if (isToday) {
+    const mins = await readMinutes(c.env, c.get('userId'), start, start + DAY)
+    liveSteps = mins.reduce((a, m) => a + (m.steps ?? 0), 0)
+  }
 
   const dr = await c.env.DB.prepare(
     'SELECT strain, hr_zones, wear_min, strain_curve, hr_max, hr_min, hr_avg, acwr, fitness_trend, ' +
@@ -129,7 +137,7 @@ export async function getDayStrain(c: Ctx) {
       ? { fitness: dr?.fitness ?? null, fatigue: dr?.fatigue ?? null, form: dr?.form ?? null } : null,
     monotony: dr?.monotony ?? null,
     calories: dr?.calories ?? null,
-    steps: dr?.steps ?? null,
+    steps: liveSteps ?? dr?.steps ?? null,
     drivers: dr?.drivers ? safe(dr.drivers) : null,
     sessions: (sessions ?? []).map((s: any) => ({
       ...s, zones: s.zones ? safe(s.zones) : null,

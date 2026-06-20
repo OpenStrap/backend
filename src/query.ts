@@ -48,6 +48,13 @@ export async function getToday(c: Ctx) {
   // Live status: most recent minute (HR + worn) in the last 10 minutes (day-packed store).
   const live = await latestMinute(c.env, userId, nowSec() - 600, nowSec())
 
+  // Steps (AN-2554): live total = SUM of today's per-minute counts (counted at ingest
+  // into minute.steps). close_day persists the same SUM to daily.steps for past days;
+  // for TODAY we sum live so the ring updates during the day. Zero R2 (hot day blob).
+  const dayStart = Math.floor(Date.parse(`${date}T00:00:00Z`) / 1000)
+  const todayMins = await readMinutes(c.env, userId, dayStart, dayStart + 86400)
+  const liveSteps = todayMins.reduce((a, m) => a + (m.steps ?? 0), 0)
+
   const df = parseFlags(daily?.flags)
   const sf = parseFlags(sleep?.flags)
 
@@ -120,7 +127,7 @@ export async function getToday(c: Ctx) {
       fitness: { value: daily.fitness ?? null, unit: '', confidence: daily.fitness != null ? 0.6 : 0, tier: 'ESTIMATE', label: 'Fitness' },
       form: { value: daily.form ?? null, unit: '', confidence: daily.form != null ? 0.6 : 0, tier: 'ESTIMATE', label: 'Form' },
       calories: metric(daily.calories, 'kcal', 'Active calories (est.)', df, 'calories'),
-      steps: metric(daily.steps, 'steps', 'Steps (est.)', df, 'steps'),
+      steps: metric(liveSteps, 'steps', 'Steps (est.)', df, 'steps'),
       // Wear is a direct count of worn minutes — full confidence when present
       // (otherwise the UI hides any metric with null/0 confidence).
       wear_min: { ...metric(daily.wear_min, 'min', 'Worn', df, 'wear'), confidence: daily.wear_min != null ? 1 : 0, tier: 'AUTH' },
