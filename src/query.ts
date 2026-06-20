@@ -4,8 +4,10 @@
 
 import type { Context } from 'hono'
 import { calcFitnessTrend, type DayHistory } from 'openstrap-analytics'
+import { readMinutes, latestMinute } from './minute_store'
+import { ensureTodayWorkouts } from './workouts'
 
-type Ctx = Context<{ Bindings: { DB: D1Database }; Variables: { userId: string } }>
+type Ctx = Context<{ Bindings: { DB: D1Database; RAW_BUCKET?: R2Bucket }; Variables: { userId: string } }>
 
 const nowSec = () => Math.floor(Date.now() / 1000)
 const todayDate = () => new Date().toISOString().slice(0, 10)
@@ -43,10 +45,15 @@ export async function getToday(c: Ctx) {
   const u = await c.env.DB.prepare('SELECT step_goal FROM users WHERE id = ?')
     .bind(userId).first<any>()
 
-  // Live status: most recent minute (HR + worn) in the last 10 minutes.
-  const live = await c.env.DB.prepare(
-    'SELECT ts_min, hr_avg, wrist_on FROM minute WHERE user_id = ? AND ts_min >= ? ORDER BY ts_min DESC LIMIT 1',
-  ).bind(userId, nowSec() - 600).first<any>()
+  // Live status: most recent minute (HR + worn) in the last 10 minutes (day-packed store).
+  const live = await latestMinute(c.env, userId, nowSec() - 600, nowSec())
+
+  // Steps (AN-2554): live total = SUM of today's per-minute counts (counted at ingest
+  // into minute.steps). close_day persists the same SUM to daily.steps for past days;
+  // for TODAY we sum live so the ring updates during the day. Zero R2 (hot day blob).
+  const dayStart = Math.floor(Date.parse(`${date}T00:00:00Z`) / 1000)
+  const todayMins = await readMinutes(c.env, userId, dayStart, dayStart + 86400)
+  const liveSteps = todayMins.reduce((a, m) => a + (m.steps ?? 0), 0)
 
   const df = parseFlags(daily?.flags)
   const sf = parseFlags(sleep?.flags)
@@ -120,7 +127,7 @@ export async function getToday(c: Ctx) {
       fitness: { value: daily.fitness ?? null, unit: '', confidence: daily.fitness != null ? 0.6 : 0, tier: 'ESTIMATE', label: 'Fitness' },
       form: { value: daily.form ?? null, unit: '', confidence: daily.form != null ? 0.6 : 0, tier: 'ESTIMATE', label: 'Form' },
       calories: metric(daily.calories, 'kcal', 'Active calories (est.)', df, 'calories'),
-      steps: metric(daily.steps, 'steps', 'Steps (est.)', df, 'steps'),
+      steps: metric(liveSteps, 'steps', 'Steps (est.)', df, 'steps'),
       // Wear is a direct count of worn minutes — full confidence when present
       // (otherwise the UI hides any metric with null/0 confidence).
       wear_min: { ...metric(daily.wear_min, 'min', 'Worn', df, 'wear'), confidence: daily.wear_min != null ? 1 : 0, tier: 'AUTH' },
@@ -245,6 +252,7 @@ export const getStrain = rangeRows('daily')
 
 // GET /sessions?from&to — auto-detected workouts (by start_ts unix range).
 export async function getSessions(c: Ctx) {
+  await ensureTodayWorkouts(c.env.DB, c.get('userId')) // on-read auto-detect + stale close (throttled)
   const from = parseInt(c.req.query('from') || '0')
   const to = parseInt(c.req.query('to') || String(nowSec()))
   const { results } = await c.env.DB.prepare(
@@ -354,10 +362,8 @@ export async function getChart(c: Ctx) {
           ? 'steps'
           : 'hr_avg'
 
-  const { results } = await c.env.DB.prepare(
-    `SELECT ts_min, ${col} AS v, wrist_on FROM minute WHERE user_id = ? AND ts_min >= ? AND ts_min <= ? ORDER BY ts_min ASC`,
-  ).bind(userId, from, to).all<{ ts_min: number; v: number | null; wrist_on: number }>()
-  const rows = results ?? []
+  const recs = await readMinutes(c.env, userId, from, to)
+  const rows = recs.map((r) => ({ ts_min: r.ts_min, v: (r as any)[col] as number | null, wrist_on: r.wrist_on }))
 
   const MAX = 500
   let points: { ts: number; v: number | null }[]

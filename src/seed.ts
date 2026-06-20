@@ -11,6 +11,7 @@
 // orchestrates the minutes phases in chunks. Each phase is idempotent.
 
 import { processUser } from './analytics'
+import { putDay } from './minute_store'
 import { uuid } from './auth'
 
 const DAY = 86400
@@ -319,7 +320,7 @@ async function findOrCreateUser(db: D1Database, email: string, now: number): Pro
 // phase=init — create/clear user. Returns user_id.
 export async function seedInit(db: D1Database, email: string, now: number): Promise<{ user_id: string }> {
   const userId = await findOrCreateUser(db, email, now)
-  for (const t of ['minute', 'daily', 'sleep', 'sessions', 'baselines', 'analytics_cursor']) {
+  for (const t of ['minute', 'minute_day', 'daily', 'sleep', 'sessions', 'baselines', 'analytics_cursor']) {
     await db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).bind(userId).run()
   }
   return { user_id: userId }
@@ -332,23 +333,21 @@ export async function seedMinutes(
 ): Promise<{ minutes: number }> {
   const todayStart = Math.floor(now / DAY) * DAY
   const firstDayStart = todayStart - (days - 1) * DAY
-  const insert = db.prepare(
-    'INSERT OR REPLACE INTO minute (user_id, ts_min, hr_avg, hr_min, hr_max, hr_n, hr_sum, activity, act_sum, act_n, steps, wrist_on) ' +
-    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-  )
   let minutes = 0
   for (let d = dayFrom; d < dayTo && d < days; d++) {
     const dayStart = firstDayStart + d * DAY
     const rows = buildDay(dayStart, d, days)
-    const batch: D1PreparedStatement[] = []
-    for (const m of rows) {
-      const hr_sum = m.hr_avg * m.hr_n
+    // Day-packed store (minute_day). Build MinuteRec[] (running sums for exact merges; rr empty).
+    const recs = rows.map((m) => {
       const act_n = 60
-      const act_sum = m.activity * act_n
-      batch.push(insert.bind(userId, m.ts_min, m.hr_avg, m.hr_min, m.hr_max, m.hr_n, hr_sum,
-        m.activity, act_sum, act_n, m.steps, m.wrist_on))
-    }
-    if (batch.length) { await db.batch(batch); minutes += batch.length }
+      return {
+        ts_min: m.ts_min, hr_avg: m.hr_avg, hr_min: m.hr_min, hr_max: m.hr_max, hr_n: m.hr_n,
+        hr_sum: m.hr_avg * m.hr_n, activity: m.activity, act_sum: m.activity * act_n, act_n,
+        steps: m.steps, wrist_on: m.wrist_on, rr: [] as number[],
+      }
+    })
+    await putDay({ DB: db }, userId, recs, now)
+    minutes += recs.length
   }
   return { minutes }
 }

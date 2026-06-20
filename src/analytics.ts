@@ -8,6 +8,7 @@
 
 import {
   calcRestingHR, calcStrain, calcHrZones, calcCalories, calcSleep, calcSleepPeriods,
+  stageHypnogram,
   calcSleepRegularity, detectSessions, calcLoad, calcFitnessTrend,
   calcVo2Max, calcFitnessModel, calcMonotony,
   calcAnomaly, calcBaselines, buildCoach,
@@ -15,6 +16,7 @@ import {
   type Minute, type Profile, type Baseline, type DayHistory,
   type DailyStrain, type NightSummary, type SleepValue, type Metric, type Driver,
 } from 'openstrap-analytics'
+import { readMinutes } from './minute_store'
 
 const DAY = 86400
 
@@ -63,7 +65,7 @@ async function loadProfile(db: D1Database, userId: string): Promise<Profile> {
 
 type LoadedBaseline = Baseline & { sleeping_hr: number | null; resp_rate: number | null }
 
-async function loadBaseline(db: D1Database, userId: string): Promise<LoadedBaseline> {
+export async function loadBaseline(db: D1Database, userId: string): Promise<LoadedBaseline> {
   const b = await db.prepare(
     'SELECT resting_hr, max_hr, sleep_need_min, skin_temp, chronic_strain, sleeping_hr, resp_rate FROM baselines WHERE user_id = ?',
   ).bind(userId).first<any>()
@@ -78,12 +80,11 @@ async function loadBaseline(db: D1Database, userId: string): Promise<LoadedBasel
   }
 }
 
-async function loadMinutes(db: D1Database, userId: string, from: number, to: number): Promise<Minute[]> {
-  const { results } = await db.prepare(
-    'SELECT ts_min, hr_avg, hr_min, hr_max, hr_n, activity, steps, wrist_on FROM minute ' +
-    'WHERE user_id = ? AND ts_min >= ? AND ts_min < ? ORDER BY ts_min ASC',
-  ).bind(userId, from, to).all<MinuteRow>()
-  return (results ?? []).map(toMinute)
+export async function loadMinutes(db: D1Database, userId: string, from: number, to: number): Promise<Minute[]> {
+  // Day-packed store. processUser/wake windows are within HOT_DAYS → all in D1
+  // minute_day (RAW_BUCKET omitted = no R2 fallback needed for hot reads).
+  const recs = await readMinutes({ DB: db }, userId, from, to)
+  return recs.map(toMinute)
 }
 
 // Sleep search window for the night that WAKES on `dateDayStart`:
@@ -141,6 +142,7 @@ interface DayBuf {
   calories: ReturnType<typeof calcCalories>
   sleep: Metric<SleepValue>
   wearMin: number
+  daySteps: number                // SUM of this day's AN-2554 minute.steps
   sleepStress: string             // calcSleepStress JSON (nocturnal arousal)
   nocturnal: string               // calcNocturnalHeart JSON
   sleepingHr: number | null       // this night's sleeping-HR avg (for baseline)
@@ -264,6 +266,12 @@ export async function processUser(
     const arr = byDay.get(k)
     if (arr) arr.push(m); else byDay.set(k, [m])
   }
+  // Per-minute RR for the window → the REM tiebreaker in stageHypnogram, so the STORED
+  // sleep duration/efficiency/stages match what /day/sleep shows (Today == Sleep).
+  const rrByMin = new Map<number, number[]>()
+  for (const rec of await readMinutes({ DB: db }, userId, firstDayStart - DAY, lastDayStart + DAY)) {
+    if (rec.rr && rec.rr.length) rrByMin.set(rec.ts_min, rec.rr)
+  }
   const dayMinutes = (dayStart: number) => byDay.get(dayStart) ?? []
   // Sleep window spans the previous evening → this noon; gather the two days.
   const sleepMinutes = (dayStart: number, from: number, to: number) => {
@@ -321,6 +329,21 @@ export async function processUser(
     const sw = sleepSearchWindow(dayStart)
     const sleepMin = sleepMinutes(dayStart, sw.from, sw.to)
     const sleep = calcSleep(sleepMin, baseline)
+    // RR-aware single-source staging: calcSleep finds the boundary, stageHypnogram
+    // (same as /day/sleep, incl. the REM tiebreaker) sets the STORED duration/awake/
+    // efficiency/stages — so the Today summary can't disagree with the Sleep screen.
+    let sleepDuration = sleep.duration_min
+    let sleepEff = sleep.efficiency
+    let sleepStages = sleep.stages
+    if (sleep.onset_ts != null && sleep.wake_ts != null) {
+      const hyp = stageHypnogram(sleepMin, sleep.onset_ts, sleep.wake_ts, baseline, rrByMin)
+      if (hyp) {
+        const inBed = hyp.asleep_min + hyp.awake_min
+        sleepDuration = hyp.asleep_min
+        sleepEff = inBed > 0 ? Math.round((hyp.asleep_min / inBed) * 10000) / 10000 : sleepEff
+        sleepStages = { light_min: hyp.light_min, deep_min: hyp.deep_min, rem_min: hyp.rem_min }
+      }
+    }
     nightSummaries.push({ onset_ts: sleep.onset_ts, wake_ts: sleep.wake_ts })
     // SRI for THIS night = regularity over a trailing ~2-week window ending here.
     // Needs ≥3 valid nights or it returns conf 0 → store null (matches §6).
@@ -368,9 +391,14 @@ export async function processUser(
         s.strain, s.kcal, s.hrr60 == null ? null : Math.round(s.hrr60), JSON.stringify(s.zones), s.confidence))
     }
 
-    // -- Wear time (worn minutes). Steps are owned by steps_imu.ts (AN-2554 over
-    //    the raw IMU), written separately — processUser no longer computes them. --
+    // -- Wear time (worn minutes). --
     const wearMin = dayMin.filter((m) => m.wrist_on).length
+    // -- Steps = SUM of this day's per-minute AN-2554 counts (computed at ingest,
+    //    stored in minute.steps). Folded into the daily row here at the close so past
+    //    days have a permanent total after their minutes prune. NO R2, no recompute —
+    //    steps_imu.ts is removed; AN-2554 is the only pedometer. Today's live total is
+    //    served on-read by summing minute.steps (query.ts/daydetail.ts). --
+    const daySteps = dayMin.reduce((a, m) => a + (m.steps ?? 0), 0)
 
     // -- Nocturnal heart (sleeping-HR dynamics over the main sleep period). --
     const sleepWorn = (sleep.onset_ts && sleep.wake_ts)
@@ -412,8 +440,8 @@ export async function processUser(
       'efficiency=excluded.efficiency, light_min=excluded.light_min, deep_min=excluded.deep_min, ' +
       'rem_min=excluded.rem_min, regularity=excluded.regularity, confidence=excluded.confidence, ' +
       'flags=excluded.flags, updated_at=excluded.updated_at',
-    ).bind(userId, date, sleep.onset_ts, sleep.wake_ts, sleep.duration_min, sleep.efficiency,
-      sleep.stages?.light_min ?? null, sleep.stages?.deep_min ?? null, sleep.stages?.rem_min ?? null,
+    ).bind(userId, date, sleep.onset_ts, sleep.wake_ts, sleepDuration, sleepEff,
+      sleepStages?.light_min ?? null, sleepStages?.deep_min ?? null, sleepStages?.rem_min ?? null,
       regularityForSleep, sleep.confidence, sleepFlags, now))
     sleepN++
 
@@ -442,7 +470,7 @@ export async function processUser(
     dayBuffer.push({
       // idx points into the parallel arrays, which now START with `seedLen`
       // seeded history days — so trailing slices in Pass 3 reach into real history.
-      date, dayStart, idx: seedLen + dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin,
+      date, dayStart, idx: seedLen + dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin, daySteps,
       sleepStress: JSON.stringify(sleepStress),
       nocturnal: JSON.stringify(nocturnal),
       sleepingHr: nocturnal.sleeping_hr_avg,
@@ -459,7 +487,7 @@ export async function processUser(
   //    trailing windows that end at that day (so ACWR/fitness/SRI/anomaly vary
   //    across the history instead of collapsing to a single value). ──
   for (const buf of dayBuffer) {
-    const { date, idx, rhr, strain, zones, calories, sleep, wearMin,
+    const { date, idx, rhr, strain, zones, calories, sleep, wearMin, daySteps,
       sleepStress, nocturnal, nocturnalElevated, mainDrivers,
       strainCurve, hrMax, hrMin, hrAvg } = buf
 
@@ -584,12 +612,11 @@ export async function processUser(
     // It writes `drivers` (main metrics) via COALESCE-free set but biometrics
     // read-merges, and on the hourly path (no biometrics) main drivers stand alone.
     statements.push(db.prepare(
-      // NOTE: `steps` is intentionally NOT written here — steps_imu.ts is the sole,
-      // authoritative writer (AN-2554 over the raw IMU). processUser must not clobber it.
-      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, vo2max, fitness, fatigue, form, monotony, nocturnal_dip_pct, strain_curve, hr_max, hr_min, hr_avg, confidence, flags, updated_at) ' +
-      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
+      // `steps` = SUM of this day's AN-2554 minute counts (the only pedometer now).
+      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, steps, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, vo2max, fitness, fatigue, form, monotony, nocturnal_dip_pct, strain_curve, hr_max, hr_min, hr_avg, confidence, flags, updated_at) ' +
+      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
       'strain=excluded.strain, resting_hr=excluded.resting_hr, ' +
-      'calories=excluded.calories, wear_min=excluded.wear_min, hr_zones=excluded.hr_zones, ' +
+      'calories=excluded.calories, wear_min=excluded.wear_min, steps=excluded.steps, hr_zones=excluded.hr_zones, ' +
       'acwr=excluded.acwr, fitness_trend=excluded.fitness_trend, anomaly=excluded.anomaly, coach=excluded.coach, ' +
       'nocturnal=excluded.nocturnal, sleep_stress=excluded.sleep_stress, ' +
       'drivers=json_patch(COALESCE(daily.drivers,\'{}\'), excluded.drivers), ' +
@@ -599,7 +626,7 @@ export async function processUser(
       'confidence=excluded.confidence, flags=excluded.flags, updated_at=excluded.updated_at',
     ).bind(userId, date, strain.score, rhr.resting_hr == null ? null : Math.round(rhr.resting_hr),
       calories.kcal,
-      wearMin, JSON.stringify(zones), load.acwr, fitness.direction,
+      wearMin, daySteps, JSON.stringify(zones), load.acwr, fitness.direction,
       bodyAlert, JSON.stringify(coach), nocturnal, sleepStress, driversJson,
       vo2.vo2max, fitModel.fitness, fitModel.fatigue, fitModel.form, monotony.monotony, nocDip,
       strainCurve, hrMax, hrMin, hrAvg,
