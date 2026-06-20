@@ -437,7 +437,7 @@ export async function getDayHeart(c: Ctx) {
   const start = dayStartOf(date)
   const mins = await loadMinutes(c, start, start + DAY)
   const d = await c.env.DB.prepare(
-    'SELECT resting_hr, recovery, readiness, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hrv_cv, irregular, hr_zones, nocturnal, stress, illness, drivers, resp_rate, resp_conf, spo2_idx FROM daily WHERE user_id = ? AND date = ?',
+    'SELECT resting_hr, recovery, readiness, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hrv_cv, irregular, hr_zones, nocturnal, stress, illness, drivers, resp_rate, resp_conf, spo2_idx, skin_temp_idx FROM daily WHERE user_id = ? AND date = ?',
   ).bind(userId, date).first<any>()
   const base = await c.env.DB.prepare('SELECT resting_hr, hrv_rmssd FROM baselines WHERE user_id = ?')
     .bind(userId).first<any>()
@@ -465,6 +465,7 @@ export async function getDayHeart(c: Ctx) {
     resp: (d?.resp_rate != null && (d?.resp_conf ?? 0) >= 0.3)
       ? { value: d.resp_rate, confidence: d.resp_conf } : null,
     spo2: d?.spo2_idx != null ? { value: d.spo2_idx } : null,
+    skin_temp: d?.skin_temp_idx != null ? { value: d.skin_temp_idx } : null,
     drivers: parse(d?.drivers ?? null),
   }
   })
