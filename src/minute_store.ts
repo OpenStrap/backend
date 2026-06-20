@@ -33,6 +33,10 @@ export interface MinuteRec {
   activity: number; act_sum: number; act_n: number
   steps: number; wrist_on: number
   rr: number[]
+  // Optical aggregates (wrist-on R24 only) — running sums + count so merges stay
+  // exact and re-uploads can't double-count (edge dedupes by hex). RELATIVE raw ADCs;
+  // SpO₂/°C are derived in the close path, never on-band. Optional (older blobs lack them).
+  opt_n?: number; red_sum?: number; ir_sum?: number; temp_sum?: number
 }
 
 export interface StoreEnv { DB: D1Database; RAW_BUCKET?: R2Bucket }
@@ -118,7 +122,7 @@ export async function latestMinute(env: StoreEnv, userId: string, sinceTs: numbe
 export async function writeBatch(
   env: StoreEnv, userId: string,
   buckets: MinuteBucket[],
-  signals: Map<number, { steps: number; rr: number[] }>,
+  signals: Map<number, { steps: number; rr: number[]; opt_n?: number; red_sum?: number; ir_sum?: number; temp_sum?: number }>,
   now: number,
 ): Promise<number> {
   if (buckets.length === 0) return 0
@@ -145,6 +149,13 @@ export async function writeBatch(
       rec.steps += sig?.steps ?? 0
       const newRr = sig?.rr ?? []
       if (newRr.length >= rec.rr.length) rec.rr = newRr
+      // Optical: additive sums + count (same idempotency basis as steps — edge hex-dedup).
+      if (sig?.opt_n) {
+        rec.opt_n = (rec.opt_n ?? 0) + sig.opt_n
+        rec.red_sum = (rec.red_sum ?? 0) + (sig.red_sum ?? 0)
+        rec.ir_sum = (rec.ir_sum ?? 0) + (sig.ir_sum ?? 0)
+        rec.temp_sum = (rec.temp_sum ?? 0) + (sig.temp_sum ?? 0)
+      }
       rec.hr_avg = rec.hr_n > 0 ? Math.round(rec.hr_sum / rec.hr_n) : 0
       rec.activity = rec.act_n > 0 ? rec.act_sum / rec.act_n : 0
       map.set(b.ts_min, rec)

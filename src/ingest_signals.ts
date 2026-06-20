@@ -20,14 +20,22 @@ import { parse_r24 } from 'openstrap-protocol/ts/records'
 export interface MinuteSignal {
   steps: number
   rr: number[]
+  // Optical aggregates from wrist-on R24 (running sums + count). RELATIVE raw ADCs;
+  // the close path turns red/IR → SpO₂ index and temp → skin-temp index.
+  opt_n?: number
+  red_sum?: number
+  ir_sum?: number
+  temp_sum?: number
 }
 
 interface AccelFrame { idx: number; ts: number; mags: number[] }
+interface OpticalAcc { n: number; red: number; ir: number; temp: number }
 
-/** Build per-minute {steps, rr} from a batch of hex records. Pure; no I/O. */
+/** Build per-minute {steps, rr, optical} from a batch of hex records. Pure; no I/O. */
 export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
   const accelByMin = new Map<number, Map<string, AccelFrame>>()
   const rrByMin = new Map<number, number[]>()
+  const optByMin = new Map<number, OpticalAcc>()
 
   for (const hex of records) {
     let b: Uint8Array
@@ -42,6 +50,13 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
         const arr = rrByMin.get(m) ?? []
         for (const v of r.rr_intervals_ms) arr.push(v) // raw; gated by analytics cleanRr below
         rrByMin.set(m, arr)
+        // Optical: wrist-on only (hr>0 — off-wrist optical is meaningless). Sum red/IR/temp
+        // raw ADCs + count → per-minute means at the close, baseline-relative index there.
+        if (r.hr > 0 && r.spo2_ir_raw > 0) {
+          const o = optByMin.get(m) ?? { n: 0, red: 0, ir: 0, temp: 0 }
+          o.n += 1; o.red += r.spo2_red_raw; o.ir += r.spo2_ir_raw; o.temp += r.skin_temp_raw
+          optByMin.set(m, o)
+        }
       }
       continue
     }
@@ -68,7 +83,7 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
   }
 
   const out = new Map<number, MinuteSignal>()
-  const minutes = new Set<number>([...accelByMin.keys(), ...rrByMin.keys()])
+  const minutes = new Set<number>([...accelByMin.keys(), ...rrByMin.keys(), ...optByMin.keys()])
   for (const m of minutes) {
     let steps = 0
     const frames = accelByMin.get(m)
@@ -80,7 +95,11 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
     }
     // Single library gate (300–2000 ms + ectopic |Δ|>200ms drop) — logic lives in
     // analytics, not duplicated here.
-    out.set(m, { steps, rr: cleanRr(rrByMin.get(m) ?? []) })
+    const o = optByMin.get(m)
+    out.set(m, {
+      steps, rr: cleanRr(rrByMin.get(m) ?? []),
+      ...(o ? { opt_n: o.n, red_sum: o.red, ir_sum: o.ir, temp_sum: o.temp } : {}),
+    })
   }
   return out
 }

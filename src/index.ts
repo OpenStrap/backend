@@ -371,10 +371,17 @@ app.post('/admin/issue-token', async (c) => {
 // Enqueue an analytics job for a user (ops + verification). The consumer runs it
 // in its own bounded invocation. 404 if Queues isn't bound.
 app.post('/admin/enqueue', async (c) => {
-  const body = await c.req.json<{ user_id: string; job?: AnalyticsJob; day?: string }>().catch(() => ({} as any))
+  const body = await c.req.json<{ user_id: string; job?: AnalyticsJob; day?: string; onset_ts?: number; wake_ts?: number }>().catch(() => ({} as any))
   if (!body.user_id) return c.json({ error: 'user_id required' }, 400)
   if (!c.env.ANALYTICS_Q) return c.json({ error: 'queue not bound' }, 404)
-  const msg = { user_id: body.user_id, job: body.job ?? 'sweep', ...(body.day ? { day: body.day } : {}) }
+  const msg = {
+    user_id: body.user_id, job: body.job ?? 'sweep',
+    ...(body.day ? { day: body.day } : {}),
+    // Forward the sleep window so a close_day job can be fired for verification
+    // (the wake_cron supplies these in production).
+    ...(body.onset_ts ? { onset_ts: body.onset_ts } : {}),
+    ...(body.wake_ts ? { wake_ts: body.wake_ts } : {}),
+  }
   await c.env.ANALYTICS_Q.send(msg)
   return c.json({ ok: true, enqueued: msg })
 })
