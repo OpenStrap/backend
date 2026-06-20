@@ -141,6 +141,7 @@ interface DayBuf {
   calories: ReturnType<typeof calcCalories>
   sleep: Metric<SleepValue>
   wearMin: number
+  daySteps: number                // SUM of this day's AN-2554 minute.steps
   sleepStress: string             // calcSleepStress JSON (nocturnal arousal)
   nocturnal: string               // calcNocturnalHeart JSON
   sleepingHr: number | null       // this night's sleeping-HR avg (for baseline)
@@ -368,9 +369,14 @@ export async function processUser(
         s.strain, s.kcal, s.hrr60 == null ? null : Math.round(s.hrr60), JSON.stringify(s.zones), s.confidence))
     }
 
-    // -- Wear time (worn minutes). Steps are owned by steps_imu.ts (AN-2554 over
-    //    the raw IMU), written separately — processUser no longer computes them. --
+    // -- Wear time (worn minutes). --
     const wearMin = dayMin.filter((m) => m.wrist_on).length
+    // -- Steps = SUM of this day's per-minute AN-2554 counts (computed at ingest,
+    //    stored in minute.steps). Folded into the daily row here at the close so past
+    //    days have a permanent total after their minutes prune. NO R2, no recompute —
+    //    steps_imu.ts is removed; AN-2554 is the only pedometer. Today's live total is
+    //    served on-read by summing minute.steps (query.ts/daydetail.ts). --
+    const daySteps = dayMin.reduce((a, m) => a + (m.steps ?? 0), 0)
 
     // -- Nocturnal heart (sleeping-HR dynamics over the main sleep period). --
     const sleepWorn = (sleep.onset_ts && sleep.wake_ts)
@@ -442,7 +448,7 @@ export async function processUser(
     dayBuffer.push({
       // idx points into the parallel arrays, which now START with `seedLen`
       // seeded history days — so trailing slices in Pass 3 reach into real history.
-      date, dayStart, idx: seedLen + dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin,
+      date, dayStart, idx: seedLen + dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin, daySteps,
       sleepStress: JSON.stringify(sleepStress),
       nocturnal: JSON.stringify(nocturnal),
       sleepingHr: nocturnal.sleeping_hr_avg,
@@ -459,7 +465,7 @@ export async function processUser(
   //    trailing windows that end at that day (so ACWR/fitness/SRI/anomaly vary
   //    across the history instead of collapsing to a single value). ──
   for (const buf of dayBuffer) {
-    const { date, idx, rhr, strain, zones, calories, sleep, wearMin,
+    const { date, idx, rhr, strain, zones, calories, sleep, wearMin, daySteps,
       sleepStress, nocturnal, nocturnalElevated, mainDrivers,
       strainCurve, hrMax, hrMin, hrAvg } = buf
 
@@ -584,12 +590,11 @@ export async function processUser(
     // It writes `drivers` (main metrics) via COALESCE-free set but biometrics
     // read-merges, and on the hourly path (no biometrics) main drivers stand alone.
     statements.push(db.prepare(
-      // NOTE: `steps` is intentionally NOT written here — steps_imu.ts is the sole,
-      // authoritative writer (AN-2554 over the raw IMU). processUser must not clobber it.
-      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, vo2max, fitness, fatigue, form, monotony, nocturnal_dip_pct, strain_curve, hr_max, hr_min, hr_avg, confidence, flags, updated_at) ' +
-      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
+      // `steps` = SUM of this day's AN-2554 minute counts (the only pedometer now).
+      'INSERT INTO daily (user_id, date, strain, resting_hr, calories, wear_min, steps, hr_zones, acwr, fitness_trend, anomaly, coach, nocturnal, sleep_stress, drivers, vo2max, fitness, fatigue, form, monotony, nocturnal_dip_pct, strain_curve, hr_max, hr_min, hr_avg, confidence, flags, updated_at) ' +
+      'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, date) DO UPDATE SET ' +
       'strain=excluded.strain, resting_hr=excluded.resting_hr, ' +
-      'calories=excluded.calories, wear_min=excluded.wear_min, hr_zones=excluded.hr_zones, ' +
+      'calories=excluded.calories, wear_min=excluded.wear_min, steps=excluded.steps, hr_zones=excluded.hr_zones, ' +
       'acwr=excluded.acwr, fitness_trend=excluded.fitness_trend, anomaly=excluded.anomaly, coach=excluded.coach, ' +
       'nocturnal=excluded.nocturnal, sleep_stress=excluded.sleep_stress, ' +
       'drivers=json_patch(COALESCE(daily.drivers,\'{}\'), excluded.drivers), ' +
@@ -599,7 +604,7 @@ export async function processUser(
       'confidence=excluded.confidence, flags=excluded.flags, updated_at=excluded.updated_at',
     ).bind(userId, date, strain.score, rhr.resting_hr == null ? null : Math.round(rhr.resting_hr),
       calories.kcal,
-      wearMin, JSON.stringify(zones), load.acwr, fitness.direction,
+      wearMin, daySteps, JSON.stringify(zones), load.acwr, fitness.direction,
       bodyAlert, JSON.stringify(coach), nocturnal, sleepStress, driversJson,
       vo2.vo2max, fitModel.fitness, fitModel.fatigue, fitModel.form, monotony.monotony, nocDip,
       strainCurve, hrMax, hrMin, hrAvg,

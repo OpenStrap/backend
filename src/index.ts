@@ -12,7 +12,6 @@ import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
 import { getDayStrain, getDaySleep, getDaySleepV2, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
 import { getTrend } from './trend'
-import { runStepsImu, runStepsIncremental } from './steps_imu'
 import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts } from './workouts'
 import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
@@ -315,21 +314,8 @@ app.post('/admin/run-biometrics', async (c) => {
   return c.json({ ok: true, ...res, capped: days < reqDays, max_days: RAW_RETENTION_DAYS })
 })
 
-// Steps from the wrist IMU (AN-2554 over raw R2). mode=incremental (default) counts
-// only newly-settled minutes since the cursor; mode=full recomputes the last `days`
-// (capped to R2 retention) and realigns the cursor. Heavy (R2) → admin / cron only.
-app.post('/admin/run-steps', async (c) => {
-  const body = await c.req.json<{ user_id: string; mode?: 'incremental' | 'full'; days?: number }>().catch(() => ({} as any))
-  if (!body.user_id) return c.json({ error: 'user_id required' }, 400)
-  if (body.mode === 'full') {
-    const reqDays = body.days ?? 1
-    const days = Math.min(reqDays, RAW_RETENTION_DAYS)
-    const res = await runStepsImu(c.env, body.user_id, days)
-    return c.json({ ok: true, mode: 'full', ...res, capped: days < reqDays })
-  }
-  const res = await runStepsIncremental(c.env, body.user_id)
-  return c.json({ ok: true, mode: 'incremental', ...res })
-})
+// (Steps are AN-2554-only now: counted at ingest into minute.steps, summed into
+// daily.steps by processUser, served live on-read. No R2 step job / admin endpoint.)
 
 // Phased to stay under the free-plan per-request subrequest cap. The shell
 // orchestrates: init → minutes (chunked) → analytics. `now` is pinned across

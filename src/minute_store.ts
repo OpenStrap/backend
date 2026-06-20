@@ -136,9 +136,14 @@ export async function writeBatch(
       rec.hr_max = Math.max(rec.hr_max, b.hr_max)
       rec.act_sum += b.act_sum
       rec.act_n += b.act_n
-      rec.steps += b.steps
       rec.wrist_on = Math.max(rec.wrist_on, b.wrist_on)
-      const newRr = signals.get(b.ts_min)?.rr ?? []
+      // Steps: accumulate the AN-2554 per-minute count from the ingest signals — the
+      // SINGLE step source now (the per-record r10Motion heuristic and the R2 steps_imu
+      // recompute are both gone). Additive across batches; idempotent because the edge
+      // dedupes by raw hex, so a minute's frames are never counted twice.
+      const sig = signals.get(b.ts_min)
+      rec.steps += sig?.steps ?? 0
+      const newRr = sig?.rr ?? []
       if (newRr.length >= rec.rr.length) rec.rr = newRr
       rec.hr_avg = rec.hr_n > 0 ? Math.round(rec.hr_sum / rec.hr_n) : 0
       rec.activity = rec.act_n > 0 ? rec.act_sum / rec.act_n : 0

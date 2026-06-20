@@ -8,10 +8,11 @@ import { processUser } from './analytics'
 import { runBiometrics } from './biometrics'
 import { runBiometricsMinute } from './biometrics_minute'
 import { runRespRate } from './resp'
-import { runStepsImu, runStepsIncremental } from './steps_imu'
 import { invalidateDay } from './cache'
 
-export type AnalyticsJob = 'sweep' | 'biometrics' | 'resp' | 'steps_full' | 'close_day'
+// Steps are AN-2554 only, counted at ingest into minute.steps and summed into
+// daily.steps by processUser — no R2 step recompute job (steps_imu removed).
+export type AnalyticsJob = 'sweep' | 'biometrics' | 'resp' | 'close_day'
 
 export interface AnalyticsMessage {
   user_id: string
@@ -70,8 +71,9 @@ async function runJob(env: QueueEnv, userId: string, job: AnalyticsJob, day?: st
       // in HRV/recovery from D1 minute.rr — zero R2. Then invalidates the day's Tier-2
       // cache and clears the dirty flag (daytime ingests re-set it; the cron skips
       // awake-and-closed users by last_close_date, so no churn).
+      // processUser derives the day AND folds daily.steps = SUM(minute.steps) (AN-2554
+      // counted at ingest) — no separate step job.
       await processUser(env.DB, userId, { historyDays: 3 })
-      await runStepsIncremental(env, userId)
       if (day && wake_ts) {
         const from = onset_ts ?? (wake_ts - 8 * 3600)
         try { await runBiometricsMinute({ DB: env.DB, RAW_BUCKET: env.RAW_BUCKET }, userId, day, from, wake_ts + 60) } catch (e) { console.error('biometrics_minute failed', userId, day, e) }
@@ -89,15 +91,10 @@ async function runJob(env: QueueEnv, userId: string, job: AnalyticsJob, day?: st
     case 'resp':
       await runRespRate(env, userId, 2, day)
       break
-    case 'steps_full':
-      // Full AN-2554 true-up for late-arriving frames (realigns the incremental cursor).
-      await runStepsImu(env, userId, 2, day)
-      break
     case 'sweep':
     default:
-      // The frequent path: derive daily/sleep/strain (D1) + incremental steps (bounded R2).
+      // The frequent path: derive daily/sleep/strain (D1); steps folded in by processUser.
       await processUser(env.DB, userId, { historyDays: 3 })
-      await runStepsIncremental(env, userId)
       // Event-driven: if this sweep just finished a night, fire biometrics for it.
       await maybeTriggerBiometrics(env, userId)
       break
