@@ -5,6 +5,7 @@
 import type { Context } from 'hono'
 import { calcFitnessTrend, type DayHistory } from 'openstrap-analytics'
 import { readMinutes, latestMinute } from './minute_store'
+import { ensureTodayWorkouts } from './workouts'
 
 type Ctx = Context<{ Bindings: { DB: D1Database; RAW_BUCKET?: R2Bucket }; Variables: { userId: string } }>
 
@@ -244,6 +245,7 @@ export const getStrain = rangeRows('daily')
 
 // GET /sessions?from&to — auto-detected workouts (by start_ts unix range).
 export async function getSessions(c: Ctx) {
+  await ensureTodayWorkouts(c.env.DB, c.get('userId')) // on-read auto-detect + stale close (throttled)
   const from = parseInt(c.req.query('from') || '0')
   const to = parseInt(c.req.query('to') || String(nowSec()))
   const { results } = await c.env.DB.prepare(

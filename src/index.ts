@@ -460,11 +460,14 @@ export default {
   // does maintenance only: prune aged minute/events + a retry-net for missed closes.
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil((async () => {
-      try { await autoCloseStaleWorkouts(env.DB) } catch (e) { console.error('autoclose failed', e) }
-      // EVERY tick — wake detection only (the cron's sole job).
+      // EVERY tick — wake detection ONLY (the cron's sole job). Auto-workout detection
+      // and forgotten-live-workout close moved ON-READ (workouts.ensureTodayWorkouts);
+      // the nightly tick keeps autoCloseStaleWorkouts as a safety net for users who
+      // never open the app.
       try { await runWakeLadder(env) } catch (e) { console.error('wake ladder failed', e) }
       // Nightly maintenance ONLY (separate from detection): seal + retention + retry-net.
       if (event.cron === '30 3 * * *') {
+        try { await autoCloseStaleWorkouts(env.DB) } catch (e) { console.error('autoclose failed', e) }
         // Seal days older than the hot window to gzipped R2 objects and drop them from
         // D1 (D1-hot / R2-sealed tiering — cuts D1 storage + per-row prune-deletes).
         try { await sealOldDays(env) } catch (e) { console.error('seal failed', e) }

@@ -10,6 +10,7 @@
 import type { Context } from 'hono'
 import { cached, ttlForDate } from './cache'
 import { readMinutes } from './minute_store'
+import { ensureTodayWorkouts } from './workouts'
 import { calcCircadian, stageSleep } from 'openstrap-analytics'
 
 type Ctx = Context<{ Bindings: { DB: D1Database; RAW_BUCKET?: R2Bucket }; Variables: { userId: string } }>
@@ -90,6 +91,9 @@ export async function getDayStrain(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
   const start = dayStartOf(date)
+  // For today, refresh auto-detected sessions on read (throttled) so the day's
+  // workout list isn't stale until the next wake-close.
+  if (date === new Date().toISOString().slice(0, 10)) await ensureTodayWorkouts(c.env.DB, c.get('userId'))
 
   const dr = await c.env.DB.prepare(
     'SELECT strain, hr_zones, wear_min, strain_curve, hr_max, hr_min, hr_avg, acwr, fitness_trend, ' +
