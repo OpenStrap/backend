@@ -10,36 +10,57 @@
 import type { Context } from 'hono'
 import { cached, ttlForDate } from './cache'
 import { readMinutes } from './minute_store'
+import { calcCircadian, stageSleep } from 'openstrap-analytics'
 
 type Ctx = Context<{ Bindings: { DB: D1Database; RAW_BUCKET?: R2Bucket }; Variables: { userId: string } }>
 
 const DAY = 86400
 const dayStartOf = (date: string) => Math.floor(Date.parse(`${date}T00:00:00Z`) / 1000)
 
-// Per-epoch hypnogram (BETA) from minute HR/activity vs resting HR — the same
-// heuristic the main-sleep view uses, factored out so naps render identically.
-function buildHypnogram(mins: { ts_min: number; hr_avg?: number | null; activity?: number | null }[], rhr: number): { t: number; stage: string }[] {
-  const out: { t: number; stage: string }[] = []
-  for (const m of mins) {
-    const hr = m.hr_avg ?? 0
-    const act = m.activity ?? 0
-    let stage: string
-    if (hr <= 0 || hr > 1.15 * rhr || act > 0.25) stage = 'awake'
-    else if (act < 0.01 && hr < rhr + 4) stage = 'deep'
-    else if (hr > rhr + 5) stage = 'rem'
-    else stage = 'light'
-    out.push({ t: m.ts_min, stage })
+// Per-epoch hypnogram (BETA) via analytics `stageSleep` — the SAME smoothed classifier
+// behind the stage totals (sustained-≥20min-awake reclassify + bout-merge), so the graph
+// matches the breakdown and never flaps on a single-minute HR blip or a brief off-wrist
+// gap. `mesor` from calcCircadian over the window; falls back to the simple per-minute
+// threshold ONLY if circadian can't fit (flat/too-short window).
+interface NightStaging { hypnogram: { t: number; stage: string }[]; totals: { light_min: number; deep_min: number; rem_min: number } | null }
+function stageNight(
+  mins: { ts_min: number; hr_avg?: number | null; hr_min?: number | null; hr_max?: number | null; activity?: number | null; wrist_on?: number | null; rr?: number[] | null }[],
+  onset: number, wake: number, rhr: number,
+): NightStaging {
+  const ms = mins.map((m) => ({
+    ts: m.ts_min, hr_avg: m.hr_avg ?? 0, hr_min: m.hr_min ?? 0, hr_max: m.hr_max ?? 0,
+    hr_n: (m.hr_avg ?? 0) > 0 ? 60 : 0, activity: m.activity ?? 0, steps: 0, wrist_on: !!m.wrist_on,
+    rr: m.rr ?? [],   // per-minute beat-to-beat RR → autonomic REM/deep split in stageSleep
+  }))
+  const circ = calcCircadian(ms)
+  const mesor = (circ.mesor != null && circ.mesor > rhr) ? circ.mesor : rhr + 25
+  const s = stageSleep(ms, onset, wake, mesor)
+  if (s.hypnogram.length) {
+    // ONE classifier drives BOTH the hypnogram and the reconciled totals → graph and
+    // breakdown can't disagree, no flapping, REM detected (re-tuned band).
+    return {
+      hypnogram: s.hypnogram.map((h) => ({ t: h.t, stage: h.stage })),
+      totals: { light_min: s.light_min, deep_min: s.deep_min, rem_min: s.rem_min },
+    }
   }
-  return out
+  // Fallback (circadian abstained): unsmoothed per-minute hypnogram; totals=null → caller
+  // keeps the stored breakdown.
+  const hyp = ms.filter((m) => m.ts >= onset && m.ts <= wake).map((m) => {
+    const hr = m.hr_avg, act = m.activity
+    const stage = (hr <= 0 || hr > 1.15 * rhr || act > 0.25) ? 'awake'
+      : (act < 0.01 && hr < rhr + 4) ? 'deep' : (hr > rhr + 5) ? 'rem' : 'light'
+    return { t: m.ts, stage }
+  })
+  return { hypnogram: hyp, totals: null }
 }
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
 
-interface Min { ts_min: number; hr_avg: number | null; hr_min: number | null; hr_max: number | null; activity: number | null; wrist_on: number | null }
+interface Min { ts_min: number; hr_avg: number | null; hr_min: number | null; hr_max: number | null; activity: number | null; wrist_on: number | null; rr: number[] }
 
 async function loadMinutes(c: Ctx, from: number, to: number): Promise<Min[]> {
   // Tiered read: D1 for hot days, R2 fallback for sealed days (see minute_store).
   const rows = await readMinutes(c.env, c.get('userId'), from, to)
-  return rows.map((m) => ({ ts_min: m.ts_min, hr_avg: m.hr_avg, hr_min: m.hr_min, hr_max: m.hr_max, activity: m.activity, wrist_on: m.wrist_on }))
+  return rows.map((m) => ({ ts_min: m.ts_min, hr_avg: m.hr_avg, hr_min: m.hr_min, hr_max: m.hr_max, activity: m.activity, wrist_on: m.wrist_on, rr: m.rr ?? [] }))
 }
 
 async function loadHr(c: Ctx): Promise<{ rhr: number; maxHr: number }> {
@@ -211,6 +232,9 @@ export async function getDaySleepV2(c: Ctx) {
     }
     const periods = rows.map((r: any) => {
       const pm = mins.filter((m) => m.ts_min >= r.onset_ts && m.ts_min <= (r.wake_ts ?? r.onset_ts))
+      const ng = pm.length ? stageNight(pm, r.onset_ts, r.wake_ts ?? r.onset_ts, rhr) : { hypnogram: [], totals: null }
+      const storedStages = (r.light_min != null || r.deep_min != null || r.rem_min != null)
+        ? { light_min: r.light_min, deep_min: r.deep_min, rem_min: r.rem_min } : null
       return {
         id: r.id,
         onset_ts: r.onset_ts,
@@ -218,11 +242,10 @@ export async function getDaySleepV2(c: Ctx) {
         duration_min: r.duration_min,
         in_bed_min: r.in_bed_min,
         efficiency: r.efficiency,
-        stages: (r.light_min != null || r.deep_min != null || r.rem_min != null)
-          ? { light_min: r.light_min, deep_min: r.deep_min, rem_min: r.rem_min } : null,
+        stages: ng.totals ?? storedStages, // same stageSleep source as the hypnogram → consistent
         is_main: !!r.is_main,
         confidence: r.confidence,
-        hypnogram: pm.length ? downsample(buildHypnogram(pm, rhr), 240) : [],
+        hypnogram: downsample(ng.hypnogram, 240),
       }
     })
     return {
@@ -251,22 +274,12 @@ export async function getDaySleep(c: Ctx) {
     return c.json({ date, has_sleep: false, need_min: need })
   }
   const rhr = baseline?.resting_hr && baseline.resting_hr > 0 ? baseline.resting_hr : 55
-  const mins = await loadMinutes(c, row.onset_ts, row.wake_ts + 60)
+  // WIDE window (prior evening → wake) so calcCircadian inside buildHypnogram sees the
+  // daytime HR peak and derives a real mesor; stageSleep itself only stages [onset, wake].
+  const mins = await loadMinutes(c, row.onset_ts - 16 * 3600, row.wake_ts + 3600)
 
-  // Per-epoch hypnogram (BETA, consistent with the summary's beta stages):
-  //   off-wrist / HR > 1.15*RHR → awake; very low activity + low HR → deep;
-  //   low activity + higher HR (REM-ish) → rem; else light.
-  const hypnogram: { t: number; stage: string }[] = []
-  for (const m of mins) {
-    const hr = m.hr_avg ?? 0
-    const act = m.activity ?? 0
-    let stage: string
-    if (hr <= 0 || hr > 1.15 * rhr || act > 0.25) stage = 'awake'
-    else if (act < 0.01 && hr < rhr + 4) stage = 'deep'
-    else if (hr > rhr + 5) stage = 'rem'
-    else stage = 'light'
-    hypnogram.push({ t: m.ts_min, stage })
-  }
+  // ONE classifier (analytics stageSleep) → smoothed hypnogram + reconciled totals.
+  const ng = stageNight(mins, row.onset_ts, row.wake_ts, rhr)
 
   // Sleep-debt over the last 7 real nights (incl. this one).
   const { results: recent } = await c.env.DB.prepare(
@@ -303,9 +316,9 @@ export async function getDaySleep(c: Ctx) {
     need_min: need,
     debt_min: Math.round(debt),
     regularity: row.regularity,
-    stages: { light_min: row.light_min, deep_min: row.deep_min, rem_min: row.rem_min },
+    stages: ng.totals ?? { light_min: row.light_min, deep_min: row.deep_min, rem_min: row.rem_min },
     stages_beta: true,
-    hypnogram: downsample(hypnogram, 240),
+    hypnogram: downsample(ng.hypnogram, 240),
   })
 }
 
