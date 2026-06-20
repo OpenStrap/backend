@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS users(
   weight_kg REAL,
   sex TEXT,                       -- 'm' | 'f' | NULL (NULL → sex-neutral calories)
   step_goal INTEGER,              -- user's daily step goal; NULL → client default (8000)
+  track_cycle INTEGER DEFAULT 0,  -- explicit opt-in to menstrual cycle tracking (0/1)
   created_at INTEGER NOT NULL
 );
 
@@ -65,6 +66,16 @@ CREATE TABLE IF NOT EXISTS journal(
   user_id TEXT NOT NULL,
   date TEXT NOT NULL,             -- YYYY-MM-DD
   tags TEXT,                      -- JSON array of lowercase tag strings
+  note TEXT,
+  updated_at INTEGER,
+  PRIMARY KEY(user_id, date)
+);
+
+-- Menstrual cycle log — user-logged period events (the anchor for calcCycle).
+CREATE TABLE IF NOT EXISTS cycle_log(
+  user_id TEXT NOT NULL,
+  date TEXT NOT NULL,             -- YYYY-MM-DD
+  kind TEXT NOT NULL,             -- 'start' | 'end' | 'spotting'
   note TEXT,
   updated_at INTEGER,
   PRIMARY KEY(user_id, date)

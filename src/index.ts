@@ -10,6 +10,8 @@ import { sealOldDays, pruneMinuteDays } from './minute_store'
 import { getToday, getSleep, getSleepV2, getStrain, getSessions, getTrends, getChart } from './query'
 import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
+import { postCycleLog, deleteCycleLog, getCycle } from './cycle'
+import { postSpotCheck } from './spotcheck'
 import { getDayStrain, getDaySleep, getDaySleepV2, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
 import { getTrend } from './trend'
 import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts } from './workouts'
@@ -78,6 +80,9 @@ app.use('/chart', requireJwt)
 app.use('/history', requireJwt)
 app.use('/journal', requireJwt)
 app.use('/journal/*', requireJwt)
+app.use('/cycle', requireJwt)
+app.use('/cycle/*', requireJwt)
+app.use('/spotcheck', requireJwt)
 app.use('/day/*', requireJwt)
 app.use('/trend/*', requireJwt)
 app.use('/workout/*', requireJwt)
@@ -198,25 +203,27 @@ app.post('/auth/refresh', async (c) => {
 
 app.get('/profile', async (c) => {
   const user = await c.env.DB.prepare(
-    'SELECT id, email, name, age, height_cm, weight_kg, sex, step_goal, created_at FROM users WHERE id = ?',
+    'SELECT id, email, name, age, height_cm, weight_kg, sex, step_goal, track_cycle, created_at FROM users WHERE id = ?',
   ).bind(c.get('userId')).first()
   if (!user) return c.json({ error: 'Not found' }, 404)
   return c.json(user)
 })
 
 app.patch('/profile', async (c) => {
-  const { name, age, height_cm, weight_kg, sex, step_goal } =
-    await c.req.json<{ name?: string; age?: number; height_cm?: number; weight_kg?: number; sex?: string; step_goal?: number }>()
+  const { name, age, height_cm, weight_kg, sex, step_goal, track_cycle } =
+    await c.req.json<{ name?: string; age?: number; height_cm?: number; weight_kg?: number; sex?: string; step_goal?: number; track_cycle?: boolean | number }>()
   const sexVal = sex === 'm' || sex === 'f' ? sex : null
   // step_goal: clamp to a sane range when provided; null leaves it unchanged.
   const goalVal = (typeof step_goal === 'number' && isFinite(step_goal))
     ? Math.max(1000, Math.min(50000, Math.round(step_goal))) : null
+  // track_cycle: explicit opt-in toggle (null leaves it unchanged).
+  const trackVal = track_cycle === undefined ? null : (track_cycle ? 1 : 0)
   await c.env.DB.prepare(
     'UPDATE users SET name=COALESCE(?,name), age=COALESCE(?,age), height_cm=COALESCE(?,height_cm), ' +
-    'weight_kg=COALESCE(?,weight_kg), sex=COALESCE(?,sex), step_goal=COALESCE(?,step_goal) WHERE id = ?',
-  ).bind(name ?? null, age ?? null, height_cm ?? null, weight_kg ?? null, sexVal, goalVal, c.get('userId')).run()
+    'weight_kg=COALESCE(?,weight_kg), sex=COALESCE(?,sex), step_goal=COALESCE(?,step_goal), track_cycle=COALESCE(?,track_cycle) WHERE id = ?',
+  ).bind(name ?? null, age ?? null, height_cm ?? null, weight_kg ?? null, sexVal, goalVal, trackVal, c.get('userId')).run()
   const user = await c.env.DB.prepare(
-    'SELECT id, email, name, age, height_cm, weight_kg, sex, step_goal, created_at FROM users WHERE id = ?',
+    'SELECT id, email, name, age, height_cm, weight_kg, sex, step_goal, track_cycle, created_at FROM users WHERE id = ?',
   ).bind(c.get('userId')).first()
   return c.json(user)
 })
@@ -237,6 +244,10 @@ app.get('/history', getHistory)
 app.post('/journal', postJournal)
 app.get('/journal', getJournal)
 app.get('/journal/insights', getJournalInsights)
+app.post('/cycle/log', postCycleLog)
+app.delete('/cycle/log', deleteCycleLog)
+app.get('/cycle', getCycle)
+app.post('/spotcheck', postSpotCheck)
 app.get('/day/strain', getDayStrain)
 app.get('/day/sleep', getDaySleep)
 app.get('/day/v2/sleep', getDaySleepV2)
