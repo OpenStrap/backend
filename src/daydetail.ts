@@ -8,21 +8,53 @@
 // All JWT, scoped by user_id.
 
 import type { Context } from 'hono'
+import { cached, ttlForDate } from './cache'
+import { readMinutes } from './minute_store'
+import { ensureTodayWorkouts } from './workouts'
+import { stageHypnogram, detectSleepCycles } from 'openstrap-analytics'
 
-type Ctx = Context<{ Bindings: { DB: D1Database }; Variables: { userId: string } }>
+type Ctx = Context<{ Bindings: { DB: D1Database; RAW_BUCKET?: R2Bucket }; Variables: { userId: string } }>
 
 const DAY = 86400
 const dayStartOf = (date: string) => Math.floor(Date.parse(`${date}T00:00:00Z`) / 1000)
+
+// Per-minute hypnogram (BETA) via analytics `stageHypnogram` — the v1 method:
+// calcSleep's Cole-Kripke + HR-dip mask owns asleep/awake, the SAME HR-percentile bands
+// as estimateStages own deep/light/rem within sleep, bout-smoothed once. ONE source for
+// both the graph and the totals (so they can't disagree), no second stager, no RR, no
+// per-night knob — exactly what worked in v1.
+interface NightStaging { hypnogram: { t: number; stage: string }[]; totals: { light_min: number; deep_min: number; rem_min: number } | null; awake_min?: number; asleep_min?: number }
+function stageNight(
+  mins: { ts_min: number; hr_avg?: number | null; hr_min?: number | null; hr_max?: number | null; activity?: number | null; wrist_on?: number | null; rr?: number[] | null }[],
+  onset: number, wake: number, rhr: number,
+): NightStaging {
+  const ms = mins.map((m) => ({
+    ts: m.ts_min, hr_avg: m.hr_avg ?? 0, hr_min: m.hr_min ?? 0, hr_max: m.hr_max ?? 0,
+    hr_n: (m.hr_avg ?? 0) > 0 ? 60 : 0, activity: m.activity ?? 0, steps: 0, wrist_on: !!m.wrist_on,
+  }))
+  // Per-minute RR → the REM tiebreaker in stageHypnogram (high HR + low RMSSD = REM, not awake).
+  const rrByMin = new Map<number, number[]>()
+  for (const m of mins) if (m.rr && m.rr.length) rrByMin.set(m.ts_min, m.rr)
+  const h = stageHypnogram(ms, onset, wake, { resting_hr: rhr, max_hr: 0, sleep_need_min: 480 }, rrByMin)
+  if (h) {
+    return {
+      hypnogram: h.hypnogram.map((x) => ({ t: x.t, stage: x.stage })),
+      totals: { light_min: h.light_min, deep_min: h.deep_min, rem_min: h.rem_min },
+      awake_min: h.awake_min,
+      asleep_min: h.asleep_min,
+    }
+  }
+  // No resting-HR baseline → staging can't run; caller keeps the stored breakdown.
+  return { hypnogram: [], totals: null }
+}
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
 
-interface Min { ts_min: number; hr_avg: number | null; hr_min: number | null; hr_max: number | null; activity: number | null; wrist_on: number | null }
+interface Min { ts_min: number; hr_avg: number | null; hr_min: number | null; hr_max: number | null; activity: number | null; wrist_on: number | null; rr: number[] }
 
 async function loadMinutes(c: Ctx, from: number, to: number): Promise<Min[]> {
-  const { results } = await c.env.DB.prepare(
-    'SELECT ts_min, hr_avg, hr_min, hr_max, activity, wrist_on FROM minute ' +
-    'WHERE user_id = ? AND ts_min >= ? AND ts_min < ? ORDER BY ts_min ASC',
-  ).bind(c.get('userId'), from, to).all<Min>()
-  return results ?? []
+  // Tiered read: D1 for hot days, R2 fallback for sealed days (see minute_store).
+  const rows = await readMinutes(c.env, c.get('userId'), from, to)
+  return rows.map((m) => ({ ts_min: m.ts_min, hr_avg: m.hr_avg, hr_min: m.hr_min, hr_max: m.hr_max, activity: m.activity, wrist_on: m.wrist_on, rr: m.rr ?? [] }))
 }
 
 async function loadHr(c: Ctx): Promise<{ rhr: number; maxHr: number }> {
@@ -52,6 +84,17 @@ export async function getDayStrain(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
   const start = dayStartOf(date)
+  const isToday = date === new Date().toISOString().slice(0, 10)
+  // For today, refresh auto-detected sessions on read (throttled) so the day's
+  // workout list isn't stale until the next wake-close.
+  if (isToday) await ensureTodayWorkouts(c.env.DB, c.get('userId'))
+  // Steps (AN-2554): live SUM of today's minute.steps; past days use the stored
+  // daily.steps (persisted by processUser at close). Zero R2 — hot day blob.
+  let liveSteps: number | null = null
+  if (isToday) {
+    const mins = await readMinutes(c.env, c.get('userId'), start, start + DAY)
+    liveSteps = mins.reduce((a, m) => a + (m.steps ?? 0), 0)
+  }
 
   const dr = await c.env.DB.prepare(
     'SELECT strain, hr_zones, wear_min, strain_curve, hr_max, hr_min, hr_avg, acwr, fitness_trend, ' +
@@ -87,7 +130,7 @@ export async function getDayStrain(c: Ctx) {
       ? { fitness: dr?.fitness ?? null, fatigue: dr?.fatigue ?? null, form: dr?.form ?? null } : null,
     monotony: dr?.monotony ?? null,
     calories: dr?.calories ?? null,
-    steps: dr?.steps ?? null,
+    steps: liveSteps ?? dr?.steps ?? null,
     drivers: dr?.drivers ? safe(dr.drivers) : null,
     sessions: (sessions ?? []).map((s: any) => ({
       ...s, zones: s.zones ? safe(s.zones) : null,
@@ -109,6 +152,8 @@ const safe = (s: any) => { try { return JSON.parse(s) } catch { return null } }
 export async function getDayWear(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId')
+  const payload = await cached(c.env.DB, userId, `daywear:${date}`, ttlForDate(date), async () => {
   const start = dayStartOf(date)
   const mins = await loadMinutes(c, start, start + DAY)
 
@@ -147,10 +192,10 @@ export async function getDayWear(c: Ctx) {
   // Prefer the derived daily.wear_min when present (same source), else the live count.
   const dr = await c.env.DB.prepare(
     'SELECT wear_min FROM daily WHERE user_id = ? AND date = ?',
-  ).bind(c.get('userId'), date).first<{ wear_min: number | null }>()
+  ).bind(userId, date).first<{ wear_min: number | null }>()
   const wearMin = dr?.wear_min != null ? Math.round(dr.wear_min) : wornMin
 
-  return c.json({
+  return {
     date,
     worn_min: wearMin,
     coverage_pct: Math.round((wearMin / 1440) * 100),
@@ -160,7 +205,9 @@ export async function getDayWear(c: Ctx) {
     segments,                                 // number of separate on-wrist stretches
     longest_off_min: longestGap,              // longest off-wrist gap inside the worn window
     tier: 'AUTH',                             // straight from the device's wrist sensor
+  }
   })
+  return c.json(payload)
 }
 
 // ── /day/sleep ───────────────────────────────────────────────────────────────
@@ -170,32 +217,53 @@ export async function getDaySleepV2(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
   const userId = c.get('userId')
-  const { results } = await c.env.DB.prepare(
-    'SELECT * FROM sleep_periods WHERE user_id = ? AND date = ? ORDER BY onset_ts ASC',
-  ).bind(userId, date).all<any>()
-  const baseline = await c.env.DB.prepare('SELECT sleep_need_min FROM baselines WHERE user_id = ?')
-    .bind(userId).first<any>()
-  const need = (baseline?.sleep_need_min && baseline.sleep_need_min >= 180) ? baseline.sleep_need_min : 480
-  const periods = (results ?? []).map((r: any) => ({
-    id: r.id,
-    onset_ts: r.onset_ts,
-    wake_ts: r.wake_ts,
-    duration_min: r.duration_min,
-    in_bed_min: r.in_bed_min,
-    efficiency: r.efficiency,
-    stages: (r.light_min != null || r.deep_min != null || r.rem_min != null)
-      ? { light_min: r.light_min, deep_min: r.deep_min, rem_min: r.rem_min } : null,
-    is_main: !!r.is_main,
-    confidence: r.confidence,
-  }))
-  return c.json({
-    date,
-    has_sleep: periods.length > 0,
-    need_min: need,
-    total_asleep_min: periods.reduce((a: number, p: any) => a + (p.duration_min || 0), 0),
-    periods,
-    stages_beta: true,
+  const payload = await cached(c.env.DB, userId, `daysleepv2:${date}`, ttlForDate(date), async () => {
+    const { results } = await c.env.DB.prepare(
+      'SELECT * FROM sleep_periods WHERE user_id = ? AND date = ? ORDER BY onset_ts ASC',
+    ).bind(userId, date).all<any>()
+    const baseRow = await c.env.DB.prepare('SELECT sleep_need_min, resting_hr FROM baselines WHERE user_id = ?')
+      .bind(userId).first<any>()
+    const need = (baseRow?.sleep_need_min && baseRow.sleep_need_min >= 180) ? baseRow.sleep_need_min : 480
+    const rhr = baseRow?.resting_hr && baseRow.resting_hr > 0 ? baseRow.resting_hr : 55
+    const rows = results ?? []
+    // ONE minute read spanning all periods; slice per period for its own hypnogram so
+    // every nap renders the same banded timeline as the main sleep (computed on-read;
+    // no per-nap storage). Naps are already counted in total_asleep_min.
+    let mins: Min[] = []
+    const onsets = rows.map((r: any) => r.onset_ts).filter((x: any) => x)
+    const wakes = rows.map((r: any) => r.wake_ts).filter((x: any) => x)
+    if (onsets.length && wakes.length) {
+      mins = await loadMinutes(c, Math.min(...onsets), Math.max(...wakes) + 60)
+    }
+    const periods = rows.map((r: any) => {
+      const pm = mins.filter((m) => m.ts_min >= r.onset_ts && m.ts_min <= (r.wake_ts ?? r.onset_ts))
+      const ng = pm.length ? stageNight(pm, r.onset_ts, r.wake_ts ?? r.onset_ts, rhr) : { hypnogram: [], totals: null }
+      const storedStages = (r.light_min != null || r.deep_min != null || r.rem_min != null)
+        ? { light_min: r.light_min, deep_min: r.deep_min, rem_min: r.rem_min } : null
+      return {
+        id: r.id,
+        onset_ts: r.onset_ts,
+        wake_ts: r.wake_ts,
+        duration_min: r.duration_min,
+        in_bed_min: r.in_bed_min,
+        efficiency: r.efficiency,
+        stages: ng.totals ?? storedStages, // same stageSleep source as the hypnogram → consistent
+        is_main: !!r.is_main,
+        confidence: r.confidence,
+        hypnogram: downsample(ng.hypnogram, 240),
+      }
+    })
+    return {
+      date,
+      has_sleep: periods.length > 0,
+      need_min: need,
+      total_asleep_min: periods.reduce((a: number, p: any) => a + (p.duration_min || 0), 0),
+      naps: periods.filter((p: any) => !p.is_main).length,
+      periods,
+      stages_beta: true,
+    }
   })
+  return c.json(payload)
 }
 
 export async function getDaySleep(c: Ctx) {
@@ -211,62 +279,66 @@ export async function getDaySleep(c: Ctx) {
     return c.json({ date, has_sleep: false, need_min: need })
   }
   const rhr = baseline?.resting_hr && baseline.resting_hr > 0 ? baseline.resting_hr : 55
-  const mins = await loadMinutes(c, row.onset_ts, row.wake_ts + 60)
+  const userId = c.get('userId')
+  // Compute ONCE, then serve from the TTL read-cache (no per-read recompute): a past
+  // day is immutable (cached until prune), "today" refreshes ≤60s, and close_day's
+  // invalidateDay clears it so the next read after a close rebuilds it once.
+  const payload = await cached(c.env.DB, userId, `daysleep:${date}`, ttlForDate(date), async () => {
+    // WIDE window (prior evening → wake) so the staging window has full context.
+    const mins = await loadMinutes(c, row.onset_ts - 16 * 3600, row.wake_ts + 3600)
+    // ONE source (analytics stageHypnogram — v1 Cole-Kripke method) → hypnogram + totals.
+    const ng = stageNight(mins, row.onset_ts, row.wake_ts, rhr)
+    // Ultradian sleep cycles (Rosenblum 2024 fractal-cycle method, on smoothed z-RMSSD).
+    const cyc = detectSleepCycles(mins.map((m) => ({ ts: m.ts_min, rr: m.rr })), row.onset_ts, row.wake_ts)
 
-  // Per-epoch hypnogram (BETA, consistent with the summary's beta stages):
-  //   off-wrist / HR > 1.15*RHR → awake; very low activity + low HR → deep;
-  //   low activity + higher HR (REM-ish) → rem; else light.
-  const hypnogram: { t: number; stage: string }[] = []
-  for (const m of mins) {
-    const hr = m.hr_avg ?? 0
-    const act = m.activity ?? 0
-    let stage: string
-    if (hr <= 0 || hr > 1.15 * rhr || act > 0.25) stage = 'awake'
-    else if (act < 0.01 && hr < rhr + 4) stage = 'deep'
-    else if (hr > rhr + 5) stage = 'rem'
-    else stage = 'light'
-    hypnogram.push({ t: m.ts_min, stage })
-  }
+    // Sleep-debt over the last 7 real nights (incl. this one).
+    const { results: recent } = await c.env.DB.prepare(
+      'SELECT duration_min FROM sleep WHERE user_id = ? AND date <= ? ORDER BY date DESC LIMIT 7',
+    ).bind(userId, date).all<{ duration_min: number | null }>()
+    let debt = 0
+    for (const r of recent ?? []) { const d = r.duration_min ?? 0; if (d >= 120) debt += Math.max(0, need - d) }
 
-  // Sleep-debt over the last 7 real nights (incl. this one).
-  const { results: recent } = await c.env.DB.prepare(
-    'SELECT duration_min FROM sleep WHERE user_id = ? AND date <= ? ORDER BY date DESC LIMIT 7',
-  ).bind(c.get('userId'), date).all<{ duration_min: number | null }>()
-  let debt = 0
-  for (const r of recent ?? []) {
-    const d = r.duration_min ?? 0
-    if (d >= 120) debt += Math.max(0, need - d)
-  }
+    // Nocturnal-heart summary + gated respiratory rate for this date (stored on daily).
+    const dailyRow = await c.env.DB.prepare(
+      'SELECT nocturnal, resp_rate, resp_conf FROM daily WHERE user_id = ? AND date = ?',
+    ).bind(userId, date).first<any>()
+    const nocturnal = dailyRow?.nocturnal ? safe(dailyRow.nocturnal) : null
+    const resp = (dailyRow?.resp_rate != null && (dailyRow?.resp_conf ?? 0) >= 0.5)
+      ? { value: Math.round(dailyRow.resp_rate * 10) / 10, confidence: dailyRow.resp_conf } : null
 
-  // Nocturnal-heart summary + gated respiratory rate for this date (stored on daily).
-  const dailyRow = await c.env.DB.prepare(
-    'SELECT nocturnal, resp_rate, resp_conf FROM daily WHERE user_id = ? AND date = ?',
-  ).bind(c.get('userId'), date).first<any>()
-  const nocturnal = dailyRow?.nocturnal ? safe(dailyRow.nocturnal) : null
-  const resp = (dailyRow?.resp_rate != null && (dailyRow?.resp_conf ?? 0) >= 0.5)
-    ? { value: Math.round(dailyRow.resp_rate * 10) / 10, confidence: dailyRow.resp_conf }
-    : null
-
-  const inBed = Math.round((row.wake_ts - row.onset_ts) / 60)
-  const asleep = row.duration_min ?? 0
-  return c.json({
-    date,
-    has_sleep: true,
-    nocturnal,
-    resp,
-    onset_ts: row.onset_ts,
-    wake_ts: row.wake_ts,
-    in_bed_min: inBed,
-    duration_min: asleep,
-    awake_min: Math.max(0, inBed - asleep),
-    efficiency: row.efficiency,
-    need_min: need,
-    debt_min: Math.round(debt),
-    regularity: row.regularity,
-    stages: { light_min: row.light_min, deep_min: row.deep_min, rem_min: row.rem_min },
-    stages_beta: true,
-    hypnogram: downsample(hypnogram, 240),
+    const inBed = Math.round((row.wake_ts - row.onset_ts) / 60)
+    // Single source: duration/awake/stages all come from the one hypnogram so the
+    // breakdown and the graph can't disagree. Fall back to the stored row only if
+    // staging abstained (no resting-HR baseline).
+    const asleep = ng.asleep_min ?? row.duration_min ?? 0
+    const awakeMin = ng.awake_min ?? Math.max(0, inBed - asleep)
+    const inBedMin = ng.asleep_min != null ? asleep + awakeMin : inBed
+    const efficiency = inBedMin > 0 && ng.asleep_min != null ? Math.round((asleep / inBedMin) * 10000) / 10000 : row.efficiency
+    return {
+      date,
+      has_sleep: true,
+      nocturnal,
+      resp,
+      onset_ts: row.onset_ts,
+      wake_ts: row.wake_ts,
+      in_bed_min: inBedMin,
+      duration_min: asleep,
+      awake_min: awakeMin,
+      efficiency,
+      need_min: need,
+      debt_min: Math.round(debt),
+      regularity: row.regularity,
+      stages: ng.totals ?? { light_min: row.light_min, deep_min: row.deep_min, rem_min: row.rem_min },
+      stages_beta: true,
+      hypnogram: downsample(ng.hypnogram, 240),
+      // Ultradian cycles (NREM↔REM), fractal-cycle method on HRV. Beta.
+      cycles: cyc.cycles,
+      cycles_mean_min: cyc.mean_duration_min,
+      cycle_series: downsample(cyc.series, 240),
+      cycles_beta: true,
+    }
   })
+  return c.json(payload)
 }
 
 // ── /day/stress ──────────────────────────────────────────────────────────────
@@ -276,10 +348,11 @@ export async function getDaySleep(c: Ctx) {
 export async function getDayStress(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId') as string
+  const payload = await cached(c.env.DB, userId, `daystress:${date}`, ttlForDate(date), async () => {
   const start = dayStartOf(date)
   const mins = await loadMinutes(c, start, start + DAY)
 
-  const userId = c.get('userId') as string
   const row = await c.env.DB.prepare(
     'SELECT stress, sleep_stress, drivers FROM daily WHERE user_id = ? AND date = ?',
   ).bind(userId, date).first<{ stress: string | null; sleep_stress: string | null; drivers: string | null }>()
@@ -291,19 +364,23 @@ export async function getDayStress(c: Ctx) {
   // Factual HR timeline (bpm) — context, not a stress band.
   const hr = mins.map((m) => ({ t: m.ts_min, v: m.hr_avg ?? 0 }))
 
-  return c.json({
+  return {
     date,
     stress,         // {score, si, lf_hf, rmssd, level, drivers}
     sleep_stress: sleepStress, // {score, arousal_events, restless_min, events[...]}
     drivers: drivers?.stress ?? null,
     hr: downsample(hr, 240),
+  }
   })
+  return c.json(payload)
 }
 
 // ── /day/timeline ────────────────────────────────────────────────────────────
 export async function getDayTimeline(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId')
+  const payload = await cached(c.env.DB, userId, `daytimeline:${date}`, ttlForDate(date), async () => {
   const start = dayStartOf(date)
   const end = start + DAY
   const mins = await loadMinutes(c, start, end)
@@ -329,9 +406,9 @@ export async function getDayTimeline(c: Ctx) {
   ).bind(c.get('userId'), start, end).all<any>()
   const { results: events } = await c.env.DB.prepare(
     'SELECT event_id, ts FROM events WHERE user_id = ? AND ts >= ? AND ts < ? ORDER BY ts ASC',
-  ).bind(c.get('userId'), start, end).all<any>()
+  ).bind(userId, start, end).all<any>()
 
-  return c.json({
+  return {
     date,
     day_start: start,
     hr: downsample(hr),
@@ -343,7 +420,9 @@ export async function getDayTimeline(c: Ctx) {
       peak_hr: peak.v ? peak : null,
       low_hr: low.v ? low : null,
     },
+  }
   })
+  return c.json(payload)
 }
 
 // ── /day/heart ─────────────────────────────────────────────────────────────
@@ -353,18 +432,19 @@ export async function getDayTimeline(c: Ctx) {
 export async function getDayHeart(c: Ctx) {
   const date = (c.req.query('date') || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId')
+  const payload = await cached(c.env.DB, userId, `dayheart:${date}`, ttlForDate(date), async () => {
   const start = dayStartOf(date)
   const mins = await loadMinutes(c, start, start + DAY)
-  const userId = c.get('userId')
   const d = await c.env.DB.prepare(
-    'SELECT resting_hr, recovery, readiness, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hrv_cv, irregular, hr_zones, nocturnal, stress, illness, drivers, resp_rate, resp_conf, spo2_idx FROM daily WHERE user_id = ? AND date = ?',
+    'SELECT resting_hr, recovery, readiness, hrv_rmssd, hrv_sdnn, hrv_lfhf, hrv_conf, hrv_cv, irregular, hr_zones, nocturnal, stress, illness, drivers, resp_rate, resp_conf, spo2_idx, skin_temp_idx FROM daily WHERE user_id = ? AND date = ?',
   ).bind(userId, date).first<any>()
   const base = await c.env.DB.prepare('SELECT resting_hr, hrv_rmssd FROM baselines WHERE user_id = ?')
     .bind(userId).first<any>()
   const parse = (s: string | null) => { try { return s ? JSON.parse(s) : null } catch { return null } }
   const worn = mins.filter((m) => m.wrist_on && (m.hr_avg ?? 0) > 0)
   const hrs = worn.map((m) => m.hr_avg as number)
-  return c.json({
+  return {
     date,
     hr: downsample(mins.map((m) => ({ t: m.ts_min, v: m.hr_avg ?? 0 })), 240),
     avg_hr: hrs.length ? Math.round(hrs.reduce((a, b) => a + b, 0) / hrs.length) : null,
@@ -385,8 +465,11 @@ export async function getDayHeart(c: Ctx) {
     resp: (d?.resp_rate != null && (d?.resp_conf ?? 0) >= 0.3)
       ? { value: d.resp_rate, confidence: d.resp_conf } : null,
     spo2: d?.spo2_idx != null ? { value: d.spo2_idx } : null,
+    skin_temp: d?.skin_temp_idx != null ? { value: d.skin_temp_idx } : null,
     drivers: parse(d?.drivers ?? null),
+  }
   })
+  return c.json(payload)
 }
 
 // ── /day/lungs ─────────────────────────────────────────────────────────────

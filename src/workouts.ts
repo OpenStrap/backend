@@ -5,13 +5,17 @@
 // blipped, the record is reconstructed from uploaded data on /workout/end.
 import type { Context } from 'hono'
 import {
-  calcStrain, calcHrZones, calcCalories, calcHrRecovery,
+  calcStrain, calcHrZones, calcCalories, calcHrRecovery, detectSessions,
   type Minute, type Profile, type Baseline,
 } from 'openstrap-analytics'
+import { readMinutes } from './minute_store'
+import { cached } from './cache'
 
 type Ctx = Context<{ Bindings: { DB: D1Database }; Variables: { userId: string } }>
 const nowSec = () => Math.floor(Date.now() / 1000)
 const DAY = 86400
+const startOfDayUtc = (ts: number) => Math.floor(ts / DAY) * DAY
+const ymd = (ts: number) => new Date(ts * 1000).toISOString().slice(0, 10)
 
 const VALID_TYPES = ['run', 'cycle', 'strength', 'walk', 'swim', 'cardio', 'yoga', 'other']
 
@@ -34,13 +38,11 @@ async function loadBaseline(db: D1Database, userId: string): Promise<Baseline> {
   }
 }
 async function loadMinutes(db: D1Database, userId: string, from: number, to: number): Promise<Minute[]> {
-  const { results } = await db.prepare(
-    'SELECT ts_min, hr_avg, hr_min, hr_max, hr_n, activity, steps, wrist_on FROM minute ' +
-    'WHERE user_id = ? AND ts_min >= ? AND ts_min <= ? ORDER BY ts_min ASC',
-  ).bind(userId, from, to).all<any>()
-  return (results ?? []).map((r: any) => ({
-    ts: r.ts_min, hr_avg: r.hr_avg ?? 0, hr_min: r.hr_min ?? 0, hr_max: r.hr_max ?? 0,
-    hr_n: r.hr_n ?? 0, activity: r.activity ?? 0, steps: r.steps ?? 0, wrist_on: !!r.wrist_on,
+  // Day-packed store. Only ever called at workout-end (recent/hot) → D1 minute_day.
+  const recs = await readMinutes({ DB: db }, userId, from, to)
+  return recs.map((r) => ({
+    ts: r.ts_min, hr_avg: r.hr_avg, hr_min: r.hr_min, hr_max: r.hr_max,
+    hr_n: r.hr_n, activity: r.activity, steps: r.steps, wrist_on: !!r.wrist_on,
   }))
 }
 
@@ -119,6 +121,7 @@ const RANGE_DAYS: Record<string, number> = { week: 7, month: 35, quarter: 91, '7
 // GET /workouts?range=week|month|quarter → list + training-volume summary.
 export async function listWorkouts(c: Ctx) {
   const userId = c.get('userId')
+  await ensureTodayWorkouts(c.env.DB, userId) // on-read auto-detect + stale-live close (throttled)
   const range = c.req.query('range') || 'month'
   const days = RANGE_DAYS[range] ?? 35
   const from = nowSec() - days * DAY
@@ -277,11 +280,13 @@ function deriveEffort(
 // so a forgotten "stop" never inflates duration with idle time. Returns # closed.
 const QUIET_MIN = 12
 const MAX_LIVE_HOURS = 6
-export async function autoCloseStaleWorkouts(db: D1Database): Promise<number> {
+export async function autoCloseStaleWorkouts(db: D1Database, userId?: string): Promise<number> {
   const now = nowSec()
-  const { results } = await db.prepare(
-    "SELECT user_id, id, start_ts FROM sessions WHERE status = 'live'",
-  ).all<any>()
+  // Optionally scope to ONE user (on-demand read path); else all (nightly safety net).
+  const stmt = userId
+    ? db.prepare("SELECT user_id, id, start_ts FROM sessions WHERE status = 'live' AND user_id = ?").bind(userId)
+    : db.prepare("SELECT user_id, id, start_ts FROM sessions WHERE status = 'live'")
+  const { results } = await stmt.all<any>()
   let closed = 0
   for (const s of results ?? []) {
     const baseline = await loadBaseline(db, s.user_id)
@@ -314,3 +319,53 @@ export async function autoCloseStaleWorkouts(db: D1Database): Promise<number> {
 }
 
 function safeParse(s: string) { try { return JSON.parse(s) } catch { return null } }
+
+// ── On-demand auto-workout detection (replaces the cron sweep) ────────────────
+// detectSessions used to run only inside the once-a-day close_day (via processUser),
+// so an auto-detected workout didn't surface until the next wake. We now run it
+// ON READ for TODAY, mirroring processUser Pass-2's session block EXACTLY (delete
+// auto-non-deleted, insert 'done'/'auto'; manual/edited/deleted sessions untouched),
+// so the on-read path and the day-close produce identical rows.
+async function detectStoreDay(db: D1Database, userId: string, dayStart: number, baseline: Baseline, profile: Profile): Promise<void> {
+  const recs = await readMinutes({ DB: db }, userId, dayStart, dayStart + DAY)
+  if (!recs.length) return
+  const dayMin: Minute[] = recs.map((r) => ({
+    ts: r.ts_min, hr_avg: r.hr_avg, hr_min: r.hr_min, hr_max: r.hr_max,
+    hr_n: r.hr_n, activity: r.activity, steps: r.steps, wrist_on: !!r.wrist_on,
+  }))
+  const sessions = detectSessions(dayMin, baseline, profile)
+  const stmts: D1PreparedStatement[] = [
+    db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND status != 'deleted'")
+      .bind(userId, dayStart, dayStart + DAY),
+  ]
+  for (const s of sessions) {
+    const sid = `${userId}:${s.start_ts}`
+    stmts.push(db.prepare(
+      'INSERT INTO sessions (user_id, id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, confidence, status, source) ' +
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'done','auto') ON CONFLICT(user_id, id) DO UPDATE SET " +
+      'end_ts=excluded.end_ts, type=excluded.type, avg_hr=excluded.avg_hr, max_hr=excluded.max_hr, ' +
+      'strain=excluded.strain, calories=excluded.calories, hrr60=excluded.hrr60, zones=excluded.zones, confidence=excluded.confidence',
+    ).bind(userId, sid, s.start_ts, s.end_ts, s.type, Math.round(s.avg_hr), Math.round(s.max_hr),
+      s.strain, s.kcal, s.hrr60 == null ? null : Math.round(s.hrr60), JSON.stringify(s.zones), s.confidence))
+  }
+  await db.batch(stmts)
+}
+
+/**
+ * On-read freshness for workouts (the wake-trigger replacement for the cron sweep).
+ * Closes this user's forgotten LIVE workouts and (re)detects TODAY's auto sessions.
+ * THROTTLED via read_cache (~120s) so a burst of reads costs one detect, not N — and
+ * it only ever runs for users actively opening the app. Call from any workout-
+ * surfacing read endpoint. The nightly cron still runs autoCloseStaleWorkouts as a
+ * safety net for users who never open the app; close_day still re-derives at wake.
+ */
+export async function ensureTodayWorkouts(db: D1Database, userId: string): Promise<void> {
+  const today = ymd(nowSec())
+  await cached(db, userId, `wkscan:${today}`, 120, async () => {
+    await autoCloseStaleWorkouts(db, userId)
+    const baseline = await loadBaseline(db, userId)
+    const profile = await loadProfile(db, userId)
+    await detectStoreDay(db, userId, startOfDayUtc(nowSec()), baseline, profile)
+    return { scanned: nowSec() }
+  })
+}

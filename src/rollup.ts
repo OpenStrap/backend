@@ -46,7 +46,8 @@ export function rollupMinutes(samples: DecodedSample[]): MinuteBucket[] {
     }
     bk.act_sum += s.activity
     bk.act_n += 1
-    bk.steps += s.steps_inc
+    // steps no longer come from the per-record r10Motion heuristic (s.steps_inc) —
+    // ingest_signals' AN-2554 (calcSteps) is the sole step source, folded in writeBatch.
     if (s.wrist_on) bk.wrist_on = 1
   }
   return [...buckets.values()].sort((a, b) => a.ts_min - b.ts_min)

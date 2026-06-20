@@ -40,6 +40,7 @@ interface DayRow {
   nocturnal_dip_pct: number | null; acwr: number | null
   efficiency: number | null; deep_min: number | null; rem_min: number | null
   light_min: number | null; regularity: number | null // from sleep
+  skin_temp_idx: number | null; spo2_idx: number | null // RELATIVE deviations
 }
 
 const REGISTRY: Record<string, MetricDef> = {
@@ -74,6 +75,8 @@ const REGISTRY: Record<string, MetricDef> = {
                  target: (_r, need) => need, goalDir: 'min' },
   stress:      { pull: (r) => { try { return r.stress ? (JSON.parse(r.stress).score ?? null) : null } catch { return null } },
                  unit: '', label: 'Stress' },
+  skin_temp:   { pull: (r) => r.skin_temp_idx, unit: 'Δ', label: 'Skin temp vs baseline' },
+  spo2:        { pull: (r) => r.spo2_idx,      unit: 'Δ',  label: 'Blood-oxygen vs baseline' },
 }
 
 interface Bucket {
@@ -104,6 +107,7 @@ export async function getTrend(c: Ctx) {
     'SELECT d.date AS date, d.strain, d.recovery, d.resting_hr, d.calories, d.steps, d.wear_min, ' +
     'd.hrv_rmssd, d.resp_rate, d.stress, d.readiness, d.vo2max, d.fitness, d.fatigue, d.form, ' +
     'd.monotony, d.hrv_sdnn, d.hrv_lfhf, d.hrv_si, d.hrv_cv, d.nocturnal_dip_pct, d.acwr, ' +
+    'd.skin_temp_idx, d.spo2_idx, ' +
     's.duration_min AS duration_min, s.efficiency AS efficiency, s.deep_min AS deep_min, ' +
     's.rem_min AS rem_min, s.light_min AS light_min, s.regularity AS regularity ' +
     'FROM daily d LEFT JOIN sleep s ON s.user_id = d.user_id AND s.date = d.date ' +
