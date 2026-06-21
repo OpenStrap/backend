@@ -7,42 +7,22 @@ import { rollupMinutes } from './rollup'
 import { perMinuteSignals } from './ingest_signals'
 import { writeBatch } from './minute_store'
 
-// ── Rate limiting: per-user token bucket in a D1 row (RESILIENCE §7). ──
-// Refill RATE tokens/sec, cap BURST. One ingest = one token. Over budget → 429.
-const RL_BURST = 30          // allow short bursts (bulk reconnect upload)
-const RL_REFILL = 0.5        // 0.5 tokens/sec ≈ 30 batches/min sustained
-
-export async function checkRateLimit(db: D1Database, userId: string): Promise<boolean> {
-  const now = Math.floor(Date.now() / 1000)
-  const row = await db.prepare(
-    'SELECT tokens, updated_at FROM rate_limit WHERE user_id = ?',
-  ).bind(userId).first<{ tokens: number; updated_at: number }>()
-
-  let tokens = RL_BURST
-  if (row) {
-    const elapsed = Math.max(0, now - row.updated_at)
-    tokens = Math.min(RL_BURST, row.tokens + elapsed * RL_REFILL)
-  }
-  if (tokens < 1) {
-    // Persist the (refilled-but-still-empty) state so the clock keeps ticking.
-    await db.prepare(
-      'INSERT INTO rate_limit (user_id, tokens, updated_at) VALUES (?,?,?) ' +
-      'ON CONFLICT(user_id) DO UPDATE SET tokens=excluded.tokens, updated_at=excluded.updated_at',
-    ).bind(userId, tokens, now).run()
-    return false
-  }
-  tokens -= 1
-  await db.prepare(
-    'INSERT INTO rate_limit (user_id, tokens, updated_at) VALUES (?,?,?) ' +
-    'ON CONFLICT(user_id) DO UPDATE SET tokens=excluded.tokens, updated_at=excluded.updated_at',
-  ).bind(userId, tokens, now).run()
-  return true
-}
+// ── Rate limiting: native Workers Rate-Limiting binding (in-memory at the edge,
+// per-colo). Replaces the old D1 token-bucket, which cost 1 D1 read + 1 D1 WRITE on
+// EVERY ingest POST to maintain a bucket that — at 60s batching — never actually
+// throttled legitimate traffic (it fully refilled between posts). The binding has no
+// D1 I/O and no separate billing. Limit kept equivalent to the old 30/min (limit 30 /
+// 60s, configured as `simple` in wrangler). Per-colo + approximate, which is exactly
+// right for abuse/burst protection. Guarded so the worker still runs if the binding
+// isn't configured on a given environment (then ingest is unthrottled — the edge
+// already self-throttles to ~1 POST/min).
+interface RateLimiter { limit(opts: { key: string }): Promise<{ success: boolean }> }
 
 interface IngestEnv {
   DB: D1Database
   RAW_BUCKET: R2Bucket
   ANALYTICS_Q?: Queue
+  RATE_LIMITER?: RateLimiter
 }
 
 // Mark the user dirty so the NEXT 30-min cron sweep enqueues exactly ONE analytics
@@ -64,9 +44,10 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
   const { device_id, records } = await c.req.json<{ device_id: string; records: string[] }>()
   if (!device_id || !Array.isArray(records)) return c.json({ error: 'Invalid payload' }, 400)
 
-  // 1. Rate limit.
-  if (!(await checkRateLimit(c.env.DB, userId))) {
-    return c.json({ error: 'Rate limit exceeded' }, 429)
+  // 1. Rate limit (edge binding; no D1). Skipped if the binding isn't configured.
+  if (c.env.RATE_LIMITER) {
+    const { success } = await c.env.RATE_LIMITER.limit({ key: userId })
+    if (!success) return c.json({ error: 'Rate limit exceeded' }, 429)
   }
 
   // 2. Decode.
