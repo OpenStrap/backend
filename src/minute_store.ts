@@ -37,6 +37,11 @@ export interface MinuteRec {
   // exact and re-uploads can't double-count (edge dedupes by hex). RELATIVE raw ADCs;
   // SpO₂/°C are derived in the close path, never on-band. Optional (older blobs lack them).
   opt_n?: number; red_sum?: number; ir_sum?: number; temp_sum?: number
+  // PPG RIIV proxy: per-second mean of the R21 green channel (the only value
+  // estimateResp consumes). Present only during live optical sessions (R21 is
+  // live-stream-only), so usually empty. Replaces the R2 raw store for resp —
+  // resp is computed from this series at the wake-close. Optional (older blobs lack it).
+  green?: number[]
 }
 
 export interface StoreEnv { DB: D1Database; RAW_BUCKET?: R2Bucket }
@@ -122,7 +127,7 @@ export async function latestMinute(env: StoreEnv, userId: string, sinceTs: numbe
 export async function writeBatch(
   env: StoreEnv, userId: string,
   buckets: MinuteBucket[],
-  signals: Map<number, { steps: number; rr: number[]; opt_n?: number; red_sum?: number; ir_sum?: number; temp_sum?: number }>,
+  signals: Map<number, { steps: number; rr: number[]; opt_n?: number; red_sum?: number; ir_sum?: number; temp_sum?: number; green?: number[] }>,
   now: number,
 ): Promise<number> {
   if (buckets.length === 0) return 0
@@ -149,6 +154,9 @@ export async function writeBatch(
       rec.steps += sig?.steps ?? 0
       const newRr = sig?.rr ?? []
       if (newRr.length >= rec.rr.length) rec.rr = newRr
+      // PPG green RIIV proxy: same "keep the fuller array" idempotency as rr.
+      const newGreen = sig?.green ?? []
+      if (newGreen.length >= (rec.green?.length ?? 0)) rec.green = newGreen
       // Optical: additive sums + count (same idempotency basis as steps — edge hex-dedup).
       if (sig?.opt_n) {
         rec.opt_n = (rec.opt_n ?? 0) + sig.opt_n

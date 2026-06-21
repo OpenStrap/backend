@@ -26,21 +26,51 @@ export interface MinuteSignal {
   red_sum?: number
   ir_sum?: number
   temp_sum?: number
+  // PPG RIIV proxy: per-second mean of the R21 green channel, time-ordered. The ONLY
+  // value estimateResp consumes — so storing it lets resp compute from D1 at the close
+  // with no raw R2. Present only during live optical sessions (R21 is live-only).
+  green?: number[]
 }
 
 interface AccelFrame { idx: number; ts: number; mags: number[] }
 interface OpticalAcc { n: number; red: number; ir: number; temp: number }
+
+// One R21 record's green PPG channel → per-second mean (RIIV proxy). Mirrors
+// resp.ts decodeR21Green: rec_type 21, ts@7 (u32 LE), channel A @20 (100×u16 LE).
+function r21GreenMean(b: Uint8Array): { ts: number; mean: number } | null {
+  if (b.length < 620 || b[1] !== 21) return null
+  const view = new DataView(b.buffer, b.byteOffset, b.byteLength)
+  const ts = view.getUint32(7, true)
+  if (!(ts > 0)) return null
+  let sum = 0, n = 0
+  for (let i = 0; i < 100; i++) {
+    const o = 20 + 2 * i
+    if (o + 2 <= b.length) { sum += view.getUint16(o, true); n++ }
+  }
+  return n >= 50 ? { ts, mean: sum / n } : null
+}
 
 /** Build per-minute {steps, rr, optical} from a batch of hex records. Pure; no I/O. */
 export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
   const accelByMin = new Map<number, Map<string, AccelFrame>>()
   const rrByMin = new Map<number, number[]>()
   const optByMin = new Map<number, OpticalAcc>()
+  const greenByMin = new Map<number, { ts: number; v: number }[]>()
 
   for (const hex of records) {
     let b: Uint8Array
     try { b = hexToBytes(hex) } catch { continue }
     if (b.length < 2) continue
+
+    // R21 PPG (rec_type 21): per-second mean green → RIIV proxy for resp (D1, no R2).
+    const g = r21GreenMean(b)
+    if (g) {
+      const m = Math.floor(g.ts / 60) * 60
+      const arr = greenByMin.get(m) ?? []
+      arr.push({ ts: g.ts, v: g.mean })
+      greenByMin.set(m, arr)
+      continue
+    }
 
     // R24 (recType @ b[1] === 24): RR intervals via the protocol decoder.
     if (b[1] === 24 && b.length >= 89) {
@@ -83,7 +113,7 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
   }
 
   const out = new Map<number, MinuteSignal>()
-  const minutes = new Set<number>([...accelByMin.keys(), ...rrByMin.keys(), ...optByMin.keys()])
+  const minutes = new Set<number>([...accelByMin.keys(), ...rrByMin.keys(), ...optByMin.keys(), ...greenByMin.keys()])
   for (const m of minutes) {
     let steps = 0
     const frames = accelByMin.get(m)
@@ -93,12 +123,18 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
       for (const fr of ordered) for (const v of fr.mags) sig.push(v)
       steps = calcSteps([sig])
     }
+    // PPG green: time-ordered per-second means for the minute (RIIV series → resp at close).
+    const gArr = greenByMin.get(m)
+    const green = gArr && gArr.length
+      ? gArr.sort((a, b) => a.ts - b.ts).map((x) => x.v)
+      : undefined
     // Single library gate (300–2000 ms + ectopic |Δ|>200ms drop) — logic lives in
     // analytics, not duplicated here.
     const o = optByMin.get(m)
     out.set(m, {
       steps, rr: cleanRr(rrByMin.get(m) ?? []),
       ...(o ? { opt_n: o.n, red_sum: o.red, ir_sum: o.ir, temp_sum: o.temp } : {}),
+      ...(green ? { green } : {}),
     })
   }
   return out

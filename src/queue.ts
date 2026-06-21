@@ -5,14 +5,13 @@
 // just enqueues; the consumer fans them out, one bounded unit per invocation.
 
 import { processUser } from './analytics'
-import { runBiometrics } from './biometrics'
 import { runBiometricsMinute } from './biometrics_minute'
-import { runRespRate } from './resp'
 import { invalidateDay } from './cache'
 
-// Steps are AN-2554 only, counted at ingest into minute.steps and summed into
-// daily.steps by processUser — no R2 step recompute job (steps_imu removed).
-export type AnalyticsJob = 'sweep' | 'biometrics' | 'resp' | 'close_day'
+// [drop-r2] All HRV/resp/optical now derive from the D1 minute store at the wake-close
+// (runBiometricsMinute). The old R2 re-decode jobs ('biometrics'/'resp') and their
+// fallback trigger are gone. Steps are AN-2554, counted at ingest into the minute blob.
+export type AnalyticsJob = 'sweep' | 'close_day'
 
 export interface AnalyticsMessage {
   user_id: string
@@ -27,38 +26,6 @@ interface QueueEnv {
   DB: D1Database
   RAW_BUCKET: R2Bucket
   ANALYTICS_Q?: Queue<AnalyticsMessage>
-}
-
-// After a sweep, if a fresh night just finished (sleep with wake_ts, settled, for a
-// date we haven't scored yet), enqueue biometrics + resp for it. This makes
-// recovery/HRV appear shortly after each user WAKES — no timezone needed — instead
-// of waiting for the fixed nightly run. Fires once per night (bio_last_date guard).
-async function maybeTriggerBiometrics(env: QueueEnv, userId: string): Promise<void> {
-  if (!env.ANALYTICS_Q) return
-  const sleep = await env.DB.prepare(
-    'SELECT date, wake_ts FROM sleep WHERE user_id = ? AND onset_ts IS NOT NULL AND wake_ts IS NOT NULL ORDER BY date DESC LIMIT 1',
-  ).bind(userId).first<{ date: string; wake_ts: number }>()
-  if (!sleep) return
-  const now = Math.floor(Date.now() / 1000)
-  if (sleep.wake_ts > now - 600) return // woke <10 min ago → let the night settle; next sweep gets it
-  // Already have HRV for this night (nightly backstop or an earlier fire computed
-  // it)? Nothing to do — never re-decode R2 for a night we've already scored.
-  const have = await env.DB.prepare(
-    'SELECT 1 FROM daily WHERE user_id = ? AND date = ? AND hrv_rmssd IS NOT NULL',
-  ).bind(userId, sleep.date).first()
-  if (have) return
-  const cur = await env.DB.prepare('SELECT bio_last_date FROM analytics_cursor WHERE user_id = ?')
-    .bind(userId).first<{ bio_last_date: string | null }>()
-  // Cost cap: fire the heavy R2 decode at most ONCE per night from the event path.
-  // If that fire yields null (partial/late R2), the nightly cron retries missing
-  // nights — so we never spam the decode every 30-min sweep.
-  if (cur?.bio_last_date && cur.bio_last_date >= sleep.date) return // already fired for this night
-  await env.ANALYTICS_Q.send({ user_id: userId, job: 'biometrics', day: sleep.date })
-  await env.ANALYTICS_Q.send({ user_id: userId, job: 'resp', day: sleep.date })
-  await env.DB.prepare(
-    'INSERT INTO analytics_cursor (user_id, bio_last_date) VALUES (?,?) ' +
-    'ON CONFLICT(user_id) DO UPDATE SET bio_last_date = excluded.bio_last_date',
-  ).bind(userId, sleep.date).run()
 }
 
 // Run one bounded unit of work. Each branch is sized to fit in a single
@@ -81,22 +48,12 @@ async function runJob(env: QueueEnv, userId: string, job: AnalyticsJob, day?: st
       }
       await env.DB.prepare('UPDATE analytics_cursor SET dirty = 0 WHERE user_id = ?').bind(userId).run()
       break
-    case 'biometrics':
-      // HRV/temp/SpO₂ from RR (R2) for ONE day (day set) or the trailing window.
-      await runBiometrics(env, userId, 3, day)
-      // Legacy multi-day mode re-runs analytics so the coach picks up recovery; in
-      // per-day mode the next 'sweep' does that (recovery is written either way).
-      if (!day) await processUser(env.DB, userId, { historyDays: 2 })
-      break
-    case 'resp':
-      await runRespRate(env, userId, 2, day)
-      break
     case 'sweep':
     default:
       // The frequent path: derive daily/sleep/strain (D1); steps folded in by processUser.
+      // HRV/resp/optical are derived at the wake-close (close_day → runBiometricsMinute),
+      // not here — no R2 re-decode jobs anymore.
       await processUser(env.DB, userId, { historyDays: 3 })
-      // Event-driven: if this sweep just finished a night, fire biometrics for it.
-      await maybeTriggerBiometrics(env, userId)
       break
   }
 }
