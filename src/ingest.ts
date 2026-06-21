@@ -32,9 +32,15 @@ interface IngestEnv {
 // sweep per user per 30 min. Freshness is bounded by the sweep interval (fine — and
 // recovery still fires promptly on wake via the sleep-detection trigger).
 async function markUserDirty(env: IngestEnv, userId: string) {
+  // Cost: `dirty` stays 1 from the first ingest until the wake-close clears it, so an
+  // unconditional upsert bills a D1 ROW WRITE on every batch (~1,440/user/day) to set a
+  // flag that's already 1. The conditional DO UPDATE writes a row ONLY on the real 0→1
+  // transition (first ingest of a new cycle / after a close) — steady-state batches hit
+  // the WHERE=false path and write 0 rows (just a cheap PK read). ~1 dirty-write per
+  // wake-cycle instead of per-POST, cutting ingest D1 writes ~1/3. Same observable state.
   await env.DB.prepare(
     'INSERT INTO analytics_cursor (user_id, last_min_ts, dirty) VALUES (?,0,1) ' +
-    'ON CONFLICT(user_id) DO UPDATE SET dirty = 1',
+    'ON CONFLICT(user_id) DO UPDATE SET dirty = 1 WHERE analytics_cursor.dirty = 0',
   ).bind(userId).run()
 }
 
