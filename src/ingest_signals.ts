@@ -26,15 +26,21 @@ const HAR_MIN = 128     // need ≥~1.3 s for a defensible spectrum
  *  too little high-rate accel (e.g. flash 1 Hz minutes carry none). */
 function classifyMinute(sig: number[]): string | undefined {
   if (sig.length < HAR_MIN) return undefined
-  const counts: Record<string, number> = {}
-  for (let i = 0; i + HAR_MIN <= sig.length; i += HAR_WIN) {
-    const w = sig.slice(i, Math.min(i + HAR_WIN, sig.length))
-    const { cls } = classifyActivityWindow(extractHarFeaturesFromSmv(w, HAR_FS))
-    counts[cls] = (counts[cls] ?? 0) + 1
+  // Defensive: a HAR bug must NEVER break the ingest hot path (raw-first / never lose
+  // data). Any failure → no class label for the minute, ingest proceeds unaffected.
+  try {
+    const counts: Record<string, number> = {}
+    for (let i = 0; i + HAR_MIN <= sig.length; i += HAR_WIN) {
+      const w = sig.slice(i, Math.min(i + HAR_WIN, sig.length))
+      const { cls } = classifyActivityWindow(extractHarFeaturesFromSmv(w, HAR_FS))
+      counts[cls] = (counts[cls] ?? 0) + 1
+    }
+    let best: string | undefined, bestN = -1
+    for (const k of Object.keys(counts)) if (counts[k] > bestN) { bestN = counts[k]; best = k }
+    return best
+  } catch {
+    return undefined
   }
-  let best: string | undefined, bestN = -1
-  for (const k of Object.keys(counts)) if (counts[k] > bestN) { bestN = counts[k]; best = k }
-  return best
 }
 
 export interface MinuteSignal {
