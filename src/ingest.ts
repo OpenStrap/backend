@@ -72,20 +72,11 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
   // 2. Decode.
   const samples = decodeBatch(records)
 
-  // 3. R2 put the whole batch raw (re-decodable system of record).
-  let rawKey: string | null = null
-  if (records.length > 0) {
-    const tss = samples.map((s) => s.ts).filter((t) => t > 0)
-    const minTs = tss.length ? Math.min(...tss) : 0
-    const maxTs = tss.length ? Math.max(...tss) : 0
-    rawKey = `raw/${userId}/${device_id}/${Date.now()}-${minTs}-${maxTs}.txt`
-    try {
-      await c.env.RAW_BUCKET.put(rawKey, records.join('\n'))
-    } catch (e) {
-      console.error('R2 put failed', e)
-      rawKey = null
-    }
-  }
+  // 3. (Raw R2 archive removed.) Decoders are validated, and every surfaced signal —
+  //    HR/RR/HRV, steps, SpO₂/temp, and PPG-resp (via the R21 green RIIV proxy) — is now
+  //    derived at ingest and stored in the D1 minute blob, so there is nothing to
+  //    re-decode from raw later. RAW_BUCKET is retained ONLY for the hot/seal tier
+  //    (sealOldDays moves aged minute_day blobs to R2); no per-POST raw object is written.
 
   // 4. Rollup → day-packed minute store (ONE row per day, read-merge-write). This is
     // the cost lever: ~1 row written/day instead of ~1,440. The merge inside writeBatch
@@ -109,16 +100,15 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
   // 6. Enqueue analytics (or mark dirty). Never run inline.
   if (minutesWritten > 0) await markUserDirty(c.env, userId)
 
-  // 7. Respond. `received` = records persisted raw to R2 (the re-decodable system of
-  //    record); `decoded` = records that yielded a surfaceable sample; `minutes_written`
-  //    = per-minute rollups touched. The client shows `received` so the count is honest
-  //    (a 2xx means we stored them all), not 0.
+  // 7. Respond. `received` = records accepted (a 2xx means we decoded + rolled them into
+  //    the D1 minute store); `decoded` = records that yielded a surfaceable sample;
+  //    `minutes_written` = per-minute rollups touched. The client shows `received` so the
+  //    count is honest, not 0.
   return c.json({
     ok: true,
     received: records.length,
     decoded: samples.length,
     minutes_written: minutesWritten,
-    raw_key: rawKey,
   })
 }
 

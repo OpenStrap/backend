@@ -17,6 +17,7 @@ import {
   calcSpo2Index, median,
 } from 'openstrap-analytics'
 import { readMinutes } from './minute_store'
+import { respFromMinuteGreen } from './resp'
 
 // [v3] RAW_BUCKET + MINUTE_SOURCE: RR comes via loadDayRr (D1 minute.rr by default,
 // R2-decoded series when MINUTE_SOURCE='r2').
@@ -54,6 +55,15 @@ export async function runBiometricsMinute(
 
   const fd = freqDomainHrv(rr)
   const si = baevskyStressIndex(rr)
+
+  // PPG-resp from the stored R21 green RIIV proxy (D1, replaces the R2 re-decode).
+  // Present only when the night had a live optical session; else null → RSA-from-RR
+  // (fd.resp_rate) covers the night. Prefer PPG when it's confident.
+  const ppgResp = respFromMinuteGreen(recs)
+  const respRate = ppgResp.confidence >= 0.5 ? ppgResp.resp_rate
+    : (fd.resp_conf >= 0.3 ? fd.resp_rate : null)
+  const respConf = ppgResp.confidence >= 0.5 ? ppgResp.confidence
+    : (fd.resp_conf >= 0.3 ? fd.resp_conf : null)
 
   // 2. Prior history for Plews baseline / personal SI / illness covariance + sleep-need.
   const { results: hist } = await env.DB.prepare(
@@ -137,7 +147,7 @@ export async function runBiometricsMinute(
   ).bind(
     recovery.score, td.rmssd, conf, td.sdnn, fd.lf_hf, si.si,
     hrvStab.cv, JSON.stringify(irregular), readiness.score,
-    fd.resp_conf >= 0.3 ? fd.resp_rate : null, fd.resp_conf >= 0.3 ? fd.resp_conf : null,
+    respRate, respConf,
     // SpO₂ index only when confidence is meaningful (noisy nights → keep prior, don't regress).
     spo2.index != null && spo2.confidence >= 0.3 ? spo2.index : null, tempIdx,
     JSON.stringify(stress), JSON.stringify(illness), JSON.stringify(bioDrivers), now,
