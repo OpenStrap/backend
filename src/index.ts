@@ -23,6 +23,7 @@ import { seedInit, seedMinutes, seedAnalytics } from './seed'
 type Bindings = {
   DB: D1Database
   RAW_BUCKET: R2Bucket
+  RATE_LIMITER?: { limit(opts: { key: string }): Promise<{ success: boolean }> }
   ANALYTICS_Q?: Queue<AnalyticsMessage>
   JWT_SECRET: string
   ADMIN_TOKEN?: string
