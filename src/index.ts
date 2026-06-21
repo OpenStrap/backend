@@ -420,34 +420,6 @@ app.post('/admin/prune', async (c) => {
   return c.json({ ok: true, events_deleted: ev.meta?.changes ?? 0 })
 })
 
-// Send messages in sendBatch chunks of 100 (the Queues per-call max), so the cron
-// itself never blows its own subrequest budget no matter how many users.
-async function sendChunked(q: Queue<AnalyticsMessage>, msgs: { body: AnalyticsMessage }[]): Promise<void> {
-  for (let i = 0; i < msgs.length; i += 100) {
-    await q.sendBatch(msgs.slice(i, i + 100))
-  }
-}
-
-// One (user, job) message per user (day-less — for 'sweep').
-async function enqueueJobs(q: Queue<AnalyticsMessage>, userIds: string[], job: AnalyticsJob): Promise<void> {
-  await sendChunked(q, userIds.map((user_id) => ({ body: { user_id, job } })))
-}
-
-// One (user, job, day) message per user × day — heavy R2 jobs fanned out so each
-// consumer invocation processes exactly ONE bounded day (works for any user, no
-// matter how much they wore the band).
-async function enqueueJobDays(q: Queue<AnalyticsMessage>, userIds: string[], job: AnalyticsJob, dates: string[]): Promise<void> {
-  const msgs: { body: AnalyticsMessage }[] = []
-  for (const user_id of userIds) for (const day of dates) msgs.push({ body: { user_id, job, day } })
-  await sendChunked(q, msgs)
-}
-
-// The last `n` UTC dates (today first) as YYYY-MM-DD.
-function lastNDates(n: number): string[] {
-  const now = Math.floor(Date.now() / 1000)
-  return Array.from({ length: n }, (_, d) => new Date((Math.floor((now - d * DAY) / DAY) * DAY) * 1000).toISOString().slice(0, 10))
-}
-
 export default {
   fetch: app.fetch,
 

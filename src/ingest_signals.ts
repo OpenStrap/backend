@@ -103,22 +103,3 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
   }
   return out
 }
-
-/** Encode an RR list (ms) to a compact little-endian int16 blob. */
-export function encodeRr(rr: number[]): Uint8Array | null {
-  if (!rr.length) return null
-  const buf = new Uint8Array(rr.length * 2)
-  const view = new DataView(buf.buffer)
-  for (let i = 0; i < rr.length; i++) view.setInt16(i * 2, Math.max(0, Math.min(32767, Math.round(rr[i]))), true)
-  return buf
-}
-
-/** Decode a minute.rr blob back to an RR list (ms). */
-export function decodeRr(blob: ArrayBuffer | Uint8Array | null | undefined): number[] {
-  if (!blob) return []
-  const u8 = blob instanceof Uint8Array ? blob : new Uint8Array(blob)
-  const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength)
-  const out: number[] = []
-  for (let i = 0; i + 2 <= u8.byteLength; i += 2) out.push(view.getInt16(i, true))
-  return out
-}
