@@ -30,10 +30,37 @@ CREATE TABLE IF NOT EXISTS refresh_tokens(
 );
 CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
 
--- ── TIMESERIES ROLLUP (≤1440 rows/day/user; pruned to R2 after 90 days) ───────
--- hr_sum / act_sum / act_n are running aggregates kept so the ingest upsert can
--- merge new samples into the stored minute EXACTLY (deterministic idempotency).
--- hr_avg / activity are the derived display values (kept in sync on every write).
+-- ── TIMESERIES (day-packed) ───────────────────────────────────────────────────
+-- [feat/wake-trigger] minute_day is the HOT minute store: ONE row per (user, ymd),
+-- value = gzipped JSON MinuteRec[] (one entry per touched minute; RR rides the blob
+-- as number[]). Ingest read-merge-writes ~1 row/day instead of ~1,440. Days older
+-- than the hot window are sealed to gzipped R2 objects and the D1 row dropped; the
+-- 10-day prune drops ~1 row/day. See minute_store.ts. (migrate_v14)
+CREATE TABLE IF NOT EXISTS minute_day(
+  user_id TEXT NOT NULL,
+  ymd TEXT NOT NULL,              -- 'YYYY-MM-DD' (UTC day of the minute)
+  blob BLOB NOT NULL,             -- gzipped JSON MinuteRec[] (bound param; << 2MB cap)
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, ymd)
+) WITHOUT ROWID;
+-- seal/prune scan by day across all users (WHERE ymd < cutoff) — index the bare ymd.
+CREATE INDEX IF NOT EXISTS idx_minute_day_ymd ON minute_day(ymd);
+
+-- TTL read-cache for Tier 1/2 on-read metrics (no watermark; time-based only).
+-- key e.g. 'today:strain:2026-06-19'; today→60s, past days immutable-until-prune.
+-- See cache.ts. (migrate_v12)
+CREATE TABLE IF NOT EXISTS read_cache(
+  user_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  payload TEXT NOT NULL,          -- JSON
+  computed_at INTEGER NOT NULL,
+  PRIMARY KEY(user_id, key)
+) WITHOUT ROWID;
+
+-- ── LEGACY ROLLUP (deprecated; empty on fresh DBs) ────────────────────────────
+-- The pre-v14 row-per-minute store. Superseded by minute_day above; left in place so
+-- old deployments keep working, but ingest no longer writes here. Safe to drop once
+-- no instance predates v14.
 CREATE TABLE IF NOT EXISTS minute(
   user_id TEXT NOT NULL,
   ts_min INTEGER NOT NULL,        -- unix sec floored to minute
@@ -177,7 +204,13 @@ CREATE TABLE IF NOT EXISTS analytics_cursor(
   last_run INTEGER DEFAULT 0,
   steps_cursor_ts INTEGER,    -- incremental steps: last settled minute counted (unix s)
   steps_cursor_day TEXT,      -- UTC day the steps accumulator is for
-  bio_last_date TEXT          -- event-driven biometrics: last sleep-date already triggered
+  bio_last_date TEXT,         -- event-driven biometrics: last sleep-date already triggered
+  -- [feat/wake-trigger] incremental sleep/wake state machine (migrate_v13). The */N
+  -- cron reads these: skip awake-and-closed users, peek the asleep ones, fire close_day
+  -- once per physiological day.
+  sleep_phase TEXT,           -- 'awake' | 'asleep' | NULL
+  phase_since INTEGER,        -- unix s of last transition
+  last_close_date TEXT        -- YYYY-MM-DD of last day-close
 );
 
 -- Per-user ingest rate-limit token bucket (RESILIENCE §7).
