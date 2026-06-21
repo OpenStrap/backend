@@ -12,9 +12,9 @@ import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
 import { postCycleLog, deleteCycleLog, getCycle } from './cycle'
 import { postSpotCheck } from './spotcheck'
-import { getDayStrain, getDaySleep, getDaySleepV2, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
+import { getDayStrain, getDaySleep, getDaySleepV2, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear, getDayHrv } from './daydetail'
 import { getTrend } from './trend'
-import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts } from './workouts'
+import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts, setWorkoutType, sweepWorkoutDetection } from './workouts'
 import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { getAppStatus, adminGetConfig, adminSetConfig } from './appconfig'
@@ -254,12 +254,14 @@ app.get('/day/timeline', getDayTimeline)
 app.get('/day/stress', getDayStress)
 app.get('/day/heart', getDayHeart)
 app.get('/day/lungs', getDayLungs)
+app.get('/day/hrv', getDayHrv)
 app.get('/day/wear', getDayWear)
 app.get('/trend/:metric', getTrend)
 app.post('/workout/start', workoutStart)
 app.post('/workout/end', workoutEnd)
 app.get('/workouts', listWorkouts)
 app.get('/workout/:id', getWorkout)
+app.post('/workout/:id/type', setWorkoutType)
 app.delete('/workout/:id', deleteWorkout)
 app.get('/records', getRecords)
 app.get('/notifications', getNotifications)
@@ -404,6 +406,10 @@ export default {
       // the nightly tick keeps autoCloseStaleWorkouts as a safety net for users who
       // never open the app.
       try { await runWakeLadder(env) } catch (e) { console.error('wake ladder failed', e) }
+      // #D incremental workout detection: re-derive TODAY's auto-workouts for users who
+      // ingested since their last close, so workouts surface ~one tick after they end
+      // even with the app closed. Throttled per-user + bounded; no hot-path cost.
+      try { await sweepWorkoutDetection(env) } catch (e) { console.error('wkt sweep failed', e) }
       // Nightly maintenance ONLY (separate from detection): seal + retention + retry-net.
       if (event.cron === '30 3 * * *') {
         try { await autoCloseStaleWorkouts(env.DB) } catch (e) { console.error('autoclose failed', e) }

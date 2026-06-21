@@ -42,6 +42,11 @@ export interface MinuteRec {
   // live-stream-only), so usually empty. Replaces the R2 raw store for resp —
   // resp is computed from this series at the wake-close. Optional (older blobs lack it).
   green?: number[]
+  // Dominant HAR activity class for this minute, classified at ingest from the live
+  // high-rate accel (Mannini, see openstrap-analytics/har). One tiny enum string — NOT
+  // the raw samples. Present only for live-streamed minutes (flash R24 is 1 Hz → none).
+  // Feeds workout typing + segmentation in detectSessions. Optional (older blobs lack it).
+  act_class?: string
 }
 
 export interface StoreEnv { DB: D1Database; RAW_BUCKET?: R2Bucket }
@@ -127,7 +132,7 @@ export async function latestMinute(env: StoreEnv, userId: string, sinceTs: numbe
 export async function writeBatch(
   env: StoreEnv, userId: string,
   buckets: MinuteBucket[],
-  signals: Map<number, { steps: number; rr: number[]; opt_n?: number; red_sum?: number; ir_sum?: number; temp_sum?: number; green?: number[] }>,
+  signals: Map<number, { steps: number; rr: number[]; opt_n?: number; red_sum?: number; ir_sum?: number; temp_sum?: number; green?: number[]; act_class?: string }>,
   now: number,
 ): Promise<number> {
   if (buckets.length === 0) return 0
@@ -157,6 +162,9 @@ export async function writeBatch(
       // PPG green RIIV proxy: same "keep the fuller array" idempotency as rr.
       const newGreen = sig?.green ?? []
       if (newGreen.length >= (rec.green?.length ?? 0)) rec.green = newGreen
+      // HAR activity class (live minutes only): keep when present. Recompute on re-upload
+      // is deterministic, so a re-drained batch yields the same label.
+      if (sig?.act_class) rec.act_class = sig.act_class
       // Optical: additive sums + count (same idempotency basis as steps — edge hex-dedup).
       if (sig?.opt_n) {
         rec.opt_n = (rec.opt_n ?? 0) + sig.opt_n

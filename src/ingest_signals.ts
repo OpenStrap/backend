@@ -13,9 +13,29 @@
 // MAX, rr = longer blob), so a re-uploaded batch can't double-count and a fuller
 // batch wins.
 
-import { calcSteps, cleanRr } from 'openstrap-analytics'
+import { calcSteps, cleanRr, extractHarFeaturesFromSmv, classifyActivityWindow } from 'openstrap-analytics'
 import { frameAccel, hexToBytes, realtimeRr } from 'openstrap-protocol/ts/live'
 import { parse_r24 } from 'openstrap-protocol/ts/records'
+
+const HAR_FS = 100      // live IMU ≈ 100 Hz (R10 100 samples/s, 0x33 stream)
+const HAR_WIN = 400     // 4 s Mannini window
+const HAR_MIN = 128     // need ≥~1.3 s for a defensible spectrum
+
+/** Classify a minute's magnitude (SMV) signal into a dominant HAR class via the
+ *  Mannini feature extractor + threshold classifier. Returns undefined when there's
+ *  too little high-rate accel (e.g. flash 1 Hz minutes carry none). */
+function classifyMinute(sig: number[]): string | undefined {
+  if (sig.length < HAR_MIN) return undefined
+  const counts: Record<string, number> = {}
+  for (let i = 0; i + HAR_MIN <= sig.length; i += HAR_WIN) {
+    const w = sig.slice(i, Math.min(i + HAR_WIN, sig.length))
+    const { cls } = classifyActivityWindow(extractHarFeaturesFromSmv(w, HAR_FS))
+    counts[cls] = (counts[cls] ?? 0) + 1
+  }
+  let best: string | undefined, bestN = -1
+  for (const k of Object.keys(counts)) if (counts[k] > bestN) { bestN = counts[k]; best = k }
+  return best
+}
 
 export interface MinuteSignal {
   steps: number
@@ -30,6 +50,9 @@ export interface MinuteSignal {
   // value estimateResp consumes — so storing it lets resp compute from D1 at the close
   // with no raw R2. Present only during live optical sessions (R21 is live-only).
   green?: number[]
+  // Dominant HAR activity class for the minute, from the live high-rate accel (Mannini
+  // classifier). One tiny label — drives workout typing. Live minutes only.
+  act_class?: string
 }
 
 interface AccelFrame { idx: number; ts: number; mags: number[] }
@@ -116,12 +139,16 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
   const minutes = new Set<number>([...accelByMin.keys(), ...rrByMin.keys(), ...optByMin.keys(), ...greenByMin.keys()])
   for (const m of minutes) {
     let steps = 0
+    let act_class: string | undefined
     const frames = accelByMin.get(m)
     if (frames && frames.size > 0) {
       const ordered = [...frames.values()].sort((a, b) => a.ts - b.ts || a.idx - b.idx)
       const sig: number[] = []
       for (const fr of ordered) for (const v of fr.mags) sig.push(v)
       steps = calcSteps([sig])
+      // Classify the minute's motion at ingest (the ONLY place the high-rate accel
+      // exists) → store just the dominant class label, never the raw samples.
+      act_class = classifyMinute(sig)
     }
     // PPG green: time-ordered per-second means for the minute (RIIV series → resp at close).
     const gArr = greenByMin.get(m)
@@ -135,6 +162,7 @@ export function perMinuteSignals(records: string[]): Map<number, MinuteSignal> {
       steps, rr: cleanRr(rrByMin.get(m) ?? []),
       ...(o ? { opt_n: o.n, red_sum: o.red, ir_sum: o.ir, temp_sum: o.temp } : {}),
       ...(green ? { green } : {}),
+      ...(act_class ? { act_class } : {}),
     })
   }
   return out

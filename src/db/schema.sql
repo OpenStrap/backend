@@ -168,8 +168,12 @@ CREATE TABLE IF NOT EXISTS sessions(
   avg_hr INTEGER, max_hr INTEGER, strain REAL, calories REAL, hrr60 INTEGER, zones TEXT,
   confidence REAL,
   status TEXT,   -- 'live' | 'done'
-  source TEXT,   -- 'manual' (user started) | 'auto' (detected)
+  source TEXT,   -- 'manual' (user started) | 'auto' (minute backstop) | 'auto_live' (live-stream detected)
   title TEXT,    -- optional user label
+  segments TEXT,        -- JSON [{start_ts,end_ts,type,confidence}] phases (multi-activity workouts)
+  detected_type TEXT,   -- the HAR classifier's call at detection (calibration ledger)
+  type_confidence REAL, -- ESTIMATE confidence in the workout type
+  type_source TEXT,     -- 'model' | 'confirmed' | 'corrected'
   PRIMARY KEY(user_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, start_ts);
