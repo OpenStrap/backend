@@ -14,15 +14,17 @@
 import {
   timeDomainHrv, freqDomainHrv, baevskyStressIndex,
   calcRecovery, calcStress, calcIllness, calcHrvStability, calcIrregular, calcReadinessIndex,
-  calcSpo2Index, median,
+  calcSpo2Index, calcDesaturation, calcCycle, median,
 } from 'openstrap-analytics'
+import type { CyclePhase } from 'openstrap-analytics'
 import { readMinutes } from './minute_store'
+import { respFromMinuteGreen } from './resp'
 
 // [v3] RAW_BUCKET + MINUTE_SOURCE: RR comes via loadDayRr (D1 minute.rr by default,
 // R2-decoded series when MINUTE_SOURCE='r2').
 interface BioEnv { DB: D1Database; RAW_BUCKET?: R2Bucket; MINUTE_SOURCE?: string }
 
-interface DailyHistRow { date: string; resting_hr: number | null; hrv_rmssd: number | null; hrv_si: number | null; skin_temp_idx: number | null }
+interface DailyHistRow { date: string; resting_hr: number | null; hrv_rmssd: number | null; hrv_si: number | null; skin_temp_idx: number | null; resp_rate: number | null }
 
 /**
  * Compute + persist HRV/recovery for ONE physiological night, sourced from D1
@@ -55,16 +57,39 @@ export async function runBiometricsMinute(
   const fd = freqDomainHrv(rr)
   const si = baevskyStressIndex(rr)
 
+  // PPG-resp from the stored R21 green RIIV proxy (D1, replaces the R2 re-decode).
+  // Present only when the night had a live optical session; else null → RSA-from-RR
+  // (fd.resp_rate) covers the night. Prefer PPG when it's confident.
+  const ppgResp = respFromMinuteGreen(recs)
+  const respRate = ppgResp.confidence >= 0.5 ? ppgResp.resp_rate
+    : (fd.resp_conf >= 0.3 ? fd.resp_rate : null)
+  const respConf = ppgResp.confidence >= 0.5 ? ppgResp.confidence
+    : (fd.resp_conf >= 0.3 ? fd.resp_conf : null)
+
   // 2. Prior history for Plews baseline / personal SI / illness covariance + sleep-need.
   const { results: hist } = await env.DB.prepare(
-    'SELECT date, resting_hr, hrv_rmssd, hrv_si, skin_temp_idx FROM daily WHERE user_id = ? ORDER BY date DESC LIMIT 60',
+    'SELECT date, resting_hr, hrv_rmssd, hrv_si, skin_temp_idx, resp_rate FROM daily WHERE user_id = ? ORDER BY date DESC LIMIT 60',
   ).bind(userId).all<DailyHistRow>()
   const histRows = hist ?? []
   const rmssdHist = histRows.map((h) => h.hrv_rmssd).filter((x): x is number => x != null)
   const siHist = histRows.map((h) => h.hrv_si).filter((x): x is number => x != null)
   const rhrHist = histRows.map((h) => h.resting_hr).filter((x): x is number => x != null)
   const tempHist = histRows.map((h) => h.skin_temp_idx).filter((x): x is number => x != null)
+  const respHist = histRows.map((h) => h.resp_rate).filter((x): x is number => x != null)
   const rhrByDate = new Map(histRows.map((h) => [h.date, h.resting_hr]))
+
+  // Cycle-phase context (only for users tracking their cycle) so a luteal-phase
+  // temp/RHR rise isn't mistaken for illness. One cheap gated read; null otherwise.
+  let cyclePhase: CyclePhase | null = null
+  const trackRow = await env.DB.prepare('SELECT track_cycle FROM users WHERE id = ?')
+    .bind(userId).first<{ track_cycle: number | null }>()
+  if (trackRow?.track_cycle) {
+    const { results: starts } = await env.DB.prepare(
+      "SELECT date FROM cycle_log WHERE user_id = ? AND kind = 'start' ORDER BY date",
+    ).bind(userId).all<{ date: string }>()
+    const startDates = (starts ?? []).map((s) => s.date)
+    if (startDates.length) cyclePhase = calcCycle(startDates, date).phase
+  }
 
   const baseRow = await env.DB.prepare(
     // spo2_raw holds the rolling baseline red/IR RATIO (v2 uses the ratio, not raw red);
@@ -96,8 +121,9 @@ export async function runBiometricsMinute(
   const recovery = calcRecovery(td.rmssd, rmssdHist, { date })
   const stress = calcStress(rr, siHist, { date })
   const illness = calcIllness(
-    { resting_hr: rhrByDate.get(date) ?? null, rmssd: td.rmssd, skin_temp: tempIdx },
-    { resting_hr: rhrHist, rmssd: rmssdHist, skin_temp: tempHist },
+    { resting_hr: rhrByDate.get(date) ?? null, rmssd: td.rmssd, skin_temp: tempIdx, resp_rate: respRate },
+    { resting_hr: rhrHist, rmssd: rmssdHist, skin_temp: tempHist, resp_rate: respHist },
+    { cyclePhase },
   )
   const hrvStab = calcHrvStability([td.rmssd, ...rmssdHist].filter((x): x is number => x != null).slice(0, 14))
   const irregular = calcIrregular(rr)
@@ -124,6 +150,13 @@ export async function runBiometricsMinute(
 
   if (spo2.drivers) bioDrivers.spo2 = spo2.drivers
 
+  // Overnight SpO₂ desaturation screen (ODI-style, RELATIVE) from the same red/IR ratios.
+  // Folded into drivers so no new daily column / UPDATE change is needed.
+  const desat = calcDesaturation(spo2Ratios, baseRatio)
+  if (desat.confidence > 0 && desat.events > 0) {
+    bioDrivers.desaturation = { events: desat.events, odi: desat.odi, deepest_pct: desat.deepest_pct, note: desat.note }
+  }
+
   // 5. Persist (same null-safe COALESCE + json_patch contract as runBiometrics). SpO₂/temp
   //    now sourced from minute optical aggregates → spo2_idx / skin_temp_idx (RELATIVE).
   await env.DB.prepare(
@@ -137,7 +170,7 @@ export async function runBiometricsMinute(
   ).bind(
     recovery.score, td.rmssd, conf, td.sdnn, fd.lf_hf, si.si,
     hrvStab.cv, JSON.stringify(irregular), readiness.score,
-    fd.resp_conf >= 0.3 ? fd.resp_rate : null, fd.resp_conf >= 0.3 ? fd.resp_conf : null,
+    respRate, respConf,
     // SpO₂ index only when confidence is meaningful (noisy nights → keep prior, don't regress).
     spo2.index != null && spo2.confidence >= 0.3 ? spo2.index : null, tempIdx,
     JSON.stringify(stress), JSON.stringify(illness), JSON.stringify(bioDrivers), now,

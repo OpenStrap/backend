@@ -126,13 +126,17 @@ export async function listWorkouts(c: Ctx) {
   const days = RANGE_DAYS[range] ?? 35
   const from = nowSec() - days * DAY
   const { results } = await c.env.DB.prepare(
-    'SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, status, source, title ' +
+    'SELECT id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, status, source, title, ' +
+    'segments, detected_type, type_confidence, type_source ' +
     "FROM sessions WHERE user_id = ? AND start_ts >= ? AND status != 'deleted' ORDER BY start_ts DESC",
   ).bind(userId, from).all<any>()
   const rows = (results ?? []).map((r: any) => ({
     ...r,
     duration_min: r.end_ts && r.start_ts ? Math.max(0, Math.round((r.end_ts - r.start_ts) / 60)) : 0,
     zones: r.zones ? safeParse(r.zones) : null,
+    segments: r.segments ? safeParse(r.segments) : null,
+    // distinguish in UI: detected (auto/auto_live) vs selected (manual)
+    detected: r.source === 'auto' || r.source === 'auto_live',
   }))
   // Training-volume summary (HONEST: time/type/zones/calories — no GPS distance,
   // no rep/weight; we don't fabricate what the band can't measure).
@@ -152,6 +156,13 @@ export async function listWorkouts(c: Ctx) {
     }
   }
   const hardest = done.reduce<any>((best, r) => (best == null || (r.strain ?? 0) > (best.strain ?? 0)) ? r : best, null)
+  // Calibration ledger: of the workouts the user confirmed/corrected, how often did the
+  // classifier already have it right? Surfaced so we know when the model needs retraining.
+  const acc = await c.env.DB.prepare(
+    "SELECT COUNT(*) AS total, SUM(CASE WHEN type = detected_type THEN 1 ELSE 0 END) AS correct " +
+    "FROM sessions WHERE user_id = ? AND detected_type IS NOT NULL AND type_source IN ('confirmed','corrected')",
+  ).bind(userId).first<{ total: number; correct: number }>()
+  const accTotal = acc?.total ?? 0
   return c.json({
     range,
     workouts: rows,
@@ -162,8 +173,47 @@ export async function listWorkouts(c: Ctx) {
       by_type: byType,
       zone_min: zoneTotals,
       hardest: hardest ? { id: hardest.id, type: hardest.type, strain: hardest.strain } : null,
+      // model accuracy from user feedback (null until the user has confirmed/corrected any)
+      classifier: { reviewed: accTotal, correct: acc?.correct ?? 0, accuracy: accTotal > 0 ? Math.round(((acc!.correct) / accTotal) * 100) / 100 : null },
     },
   })
+}
+
+// POST /workout/:id/type { type } — user confirms or corrects an auto-detected type.
+// Feeds the calibration ledger (was the model right?) and pins the type so re-derivation
+// won't overwrite it. The accumulated (detected_type → corrected type) pairs are the
+// labelled dataset that will train the real classifier.
+export async function setWorkoutType(c: Ctx) {
+  const userId = c.get('userId')
+  const id = c.req.param('id')
+  const body = await c.req.json<{ type?: string }>().catch(() => ({} as any))
+  if (!body.type || !VALID_TYPES.includes(body.type)) return c.json({ error: 'invalid type' }, 400)
+  const w = await c.env.DB.prepare('SELECT detected_type FROM sessions WHERE user_id = ? AND id = ?')
+    .bind(userId, id).first<{ detected_type: string | null }>()
+  if (!w) return c.json({ error: 'not found' }, 404)
+  const source = w.detected_type && w.detected_type === body.type ? 'confirmed' : 'corrected'
+  await c.env.DB.prepare(
+    'UPDATE sessions SET type = ?, type_source = ?, type_confidence = 1.0 WHERE user_id = ? AND id = ?',
+  ).bind(body.type, source, userId, id).run()
+  return c.json({ ok: true, type: body.type, type_source: source })
+}
+
+/**
+ * sweepWorkoutDetection(env) — the #D incremental cron. Re-derive TODAY's auto-workouts
+ * for every user who's ingested since their last close (dirty=1), so a workout surfaces
+ * ~one tick (≤10 min) after it ends WITHOUT the app being opened. Reuses the throttled
+ * ensureTodayWorkouts (≤1 detect / 120 s / user) and is bounded per tick. The bout closes
+ * at its last data minute naturally (re-derivation over available minutes).
+ */
+export async function sweepWorkoutDetection(env: { DB: D1Database }, limit = 200): Promise<number> {
+  const { results } = await env.DB.prepare(
+    'SELECT user_id FROM analytics_cursor WHERE dirty = 1 LIMIT ?',
+  ).bind(limit).all<{ user_id: string }>()
+  let n = 0
+  for (const r of results ?? []) {
+    try { await ensureTodayWorkouts(env.DB, r.user_id); n++ } catch (e) { console.error('wkt detect failed', r.user_id, e) }
+  }
+  return n
 }
 
 // GET /workout/:id → full breakdown + HR/activity timeline + derived effort
@@ -332,21 +382,41 @@ async function detectStoreDay(db: D1Database, userId: string, dayStart: number, 
   const dayMin: Minute[] = recs.map((r) => ({
     ts: r.ts_min, hr_avg: r.hr_avg, hr_min: r.hr_min, hr_max: r.hr_max,
     hr_n: r.hr_n, activity: r.activity, steps: r.steps, wrist_on: !!r.wrist_on,
+    act_class: r.act_class as Minute['act_class'],
   }))
   const sessions = detectSessions(dayMin, baseline, profile)
+  // Reconcile: don't clobber the user's manual workouts, deleted tombstones, any
+  // already-typed live-detected sessions (source='auto_live'), OR any auto session the
+  // user CONFIRMED/CORRECTED (type_source in confirmed/corrected — the calibration
+  // ledger). Only the minute-detector's own un-reviewed 'auto' rows are re-derived. Then
+  // skip auto bouts that overlap any preserved session so a live-streamed or
+  // user-labelled workout isn't double-counted (and a baseline-drift start_ts shift can't
+  // spawn a duplicate that re-overwrites the user's label).
+  const { results: keep } = await db.prepare(
+    "SELECT start_ts, end_ts FROM sessions WHERE user_id = ? AND start_ts < ? AND end_ts > ? AND status != 'deleted' AND (source IN ('manual','auto_live') OR type_source IN ('confirmed','corrected'))",
+  ).bind(userId, dayStart + DAY, dayStart).all<{ start_ts: number; end_ts: number }>()
+  const covered = (keep ?? []) as { start_ts: number; end_ts: number }[]
+  const overlaps = (s: { start_ts: number; end_ts: number }) =>
+    covered.some((k) => s.start_ts < k.end_ts && s.end_ts > k.start_ts)
   const stmts: D1PreparedStatement[] = [
-    db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND status != 'deleted'")
+    db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND COALESCE(type_source,'model') NOT IN ('confirmed','corrected') AND status != 'deleted'")
       .bind(userId, dayStart, dayStart + DAY),
   ]
   for (const s of sessions) {
+    if (overlaps(s)) continue // a manual/live-detected session already owns this window
     const sid = `${userId}:${s.start_ts}`
     stmts.push(db.prepare(
-      'INSERT INTO sessions (user_id, id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, confidence, status, source) ' +
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'done','auto') ON CONFLICT(user_id, id) DO UPDATE SET " +
+      'INSERT INTO sessions (user_id, id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, confidence, status, source, segments, detected_type, type_confidence, type_source) ' +
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'done','auto',?,?,?,'model') ON CONFLICT(user_id, id) DO UPDATE SET " +
       'end_ts=excluded.end_ts, type=excluded.type, avg_hr=excluded.avg_hr, max_hr=excluded.max_hr, ' +
-      'strain=excluded.strain, calories=excluded.calories, hrr60=excluded.hrr60, zones=excluded.zones, confidence=excluded.confidence',
+      'strain=excluded.strain, calories=excluded.calories, hrr60=excluded.hrr60, zones=excluded.zones, confidence=excluded.confidence, ' +
+      // Preserve a user-confirmed/corrected type across re-derivation; only refresh the model fields.
+      'segments=excluded.segments, detected_type=excluded.detected_type, ' +
+      'type_confidence=CASE WHEN sessions.type_source IN (\'confirmed\',\'corrected\') THEN sessions.type_confidence ELSE excluded.type_confidence END, ' +
+      'type=CASE WHEN sessions.type_source IN (\'confirmed\',\'corrected\') THEN sessions.type ELSE excluded.type END',
     ).bind(userId, sid, s.start_ts, s.end_ts, s.type, Math.round(s.avg_hr), Math.round(s.max_hr),
-      s.strain, s.kcal, s.hrr60 == null ? null : Math.round(s.hrr60), JSON.stringify(s.zones), s.confidence))
+      s.strain, s.kcal, s.hrr60 == null ? null : Math.round(s.hrr60), JSON.stringify(s.zones), s.confidence,
+      s.segments ? JSON.stringify(s.segments) : null, s.detected_type ?? s.type, s.type_confidence))
   }
   await db.batch(stmts)
 }

@@ -11,7 +11,7 @@ import type { Context } from 'hono'
 import { cached, ttlForDate } from './cache'
 import { readMinutes } from './minute_store'
 import { ensureTodayWorkouts } from './workouts'
-import { stageHypnogram, detectSleepCycles } from 'openstrap-analytics'
+import { stageHypnogram, detectSleepCycles, calcDaytimeHrv } from 'openstrap-analytics'
 
 type Ctx = Context<{ Bindings: { DB: D1Database; RAW_BUCKET?: R2Bucket }; Variables: { userId: string } }>
 
@@ -371,6 +371,30 @@ export async function getDayStress(c: Ctx) {
     drivers: drivers?.stress ?? null,
     hr: downsample(hr, 240),
   }
+  })
+  return c.json(payload)
+}
+
+// ── /day/hrv ───────────────────────────────────────────────────────────────────
+// Daytime (waking) HRV timeline — the ultradian RMSSD rhythm from minute.rr OUTSIDE
+// the main sleep window. Complements nocturnal recovery: a daytime-stress curve.
+export async function getDayHrv(c: Ctx) {
+  const date = (c.req.query('date') || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ error: 'date=YYYY-MM-DD required' }, 400)
+  const userId = c.get('userId') as string
+  const payload = await cached(c.env.DB, userId, `dayhrv:${date}`, ttlForDate(date), async () => {
+    const start = dayStartOf(date)
+    const mins = await loadMinutes(c, start, start + DAY)
+    // Exclude this date's main sleep window so it's genuinely DAYTIME HRV.
+    const sleep = await c.env.DB.prepare(
+      'SELECT onset_ts, wake_ts FROM sleep WHERE user_id = ? AND date = ?',
+    ).bind(userId, date).first<{ onset_ts: number | null; wake_ts: number | null }>()
+    const inSleep = (t: number) => sleep?.onset_ts != null && sleep?.wake_ts != null && t >= sleep.onset_ts && t <= sleep.wake_ts
+    const byMinute = mins
+      .filter((m) => m.rr && m.rr.length && !inSleep(m.ts_min))
+      .map((m) => ({ ts: m.ts_min, rr: m.rr as number[] }))
+    const hrv = calcDaytimeHrv(byMinute)
+    return { date, daytime_hrv: hrv } // {rmssd_median, series[{ts,rmssd}], lowest_ts, n_windows, confidence, tier}
   })
   return c.json(payload)
 }
