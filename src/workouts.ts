@@ -385,18 +385,21 @@ async function detectStoreDay(db: D1Database, userId: string, dayStart: number, 
     act_class: r.act_class as Minute['act_class'],
   }))
   const sessions = detectSessions(dayMin, baseline, profile)
-  // Reconcile: don't clobber the user's manual workouts, deleted tombstones, OR any
-  // already-typed live-detected sessions (source='auto_live'); only the minute-detector's
-  // own 'auto' rows are re-derived. Then skip auto bouts that overlap a manual/auto_live
-  // session so a live-streamed workout isn't double-counted by the backstop.
+  // Reconcile: don't clobber the user's manual workouts, deleted tombstones, any
+  // already-typed live-detected sessions (source='auto_live'), OR any auto session the
+  // user CONFIRMED/CORRECTED (type_source in confirmed/corrected — the calibration
+  // ledger). Only the minute-detector's own un-reviewed 'auto' rows are re-derived. Then
+  // skip auto bouts that overlap any preserved session so a live-streamed or
+  // user-labelled workout isn't double-counted (and a baseline-drift start_ts shift can't
+  // spawn a duplicate that re-overwrites the user's label).
   const { results: keep } = await db.prepare(
-    "SELECT start_ts, end_ts FROM sessions WHERE user_id = ? AND start_ts < ? AND end_ts > ? AND status != 'deleted' AND source IN ('manual','auto_live')",
+    "SELECT start_ts, end_ts FROM sessions WHERE user_id = ? AND start_ts < ? AND end_ts > ? AND status != 'deleted' AND (source IN ('manual','auto_live') OR type_source IN ('confirmed','corrected'))",
   ).bind(userId, dayStart + DAY, dayStart).all<{ start_ts: number; end_ts: number }>()
   const covered = (keep ?? []) as { start_ts: number; end_ts: number }[]
   const overlaps = (s: { start_ts: number; end_ts: number }) =>
     covered.some((k) => s.start_ts < k.end_ts && s.end_ts > k.start_ts)
   const stmts: D1PreparedStatement[] = [
-    db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND status != 'deleted'")
+    db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND COALESCE(type_source,'model') NOT IN ('confirmed','corrected') AND status != 'deleted'")
       .bind(userId, dayStart, dayStart + DAY),
   ]
   for (const s of sessions) {

@@ -390,11 +390,22 @@ export async function processUser(
     // user-owned and must survive a re-derive. Deleted tombstones are KEPT so a
     // user-deleted auto session isn't resurrected (its row's status stays
     // 'deleted'; the re-insert below only updates non-status fields via ON CONFLICT).
+    // ALSO preserve any auto session the user CONFIRMED/CORRECTED (the calibration
+    // ledger): exclude it from the DELETE and skip an overlapping re-detection so a
+    // baseline-drift start_ts shift can't insert a duplicate that re-overwrites the
+    // user's label. (Without this, every re-derive wiped user corrections.)
+    const { results: keepRev } = await db.prepare(
+      "SELECT start_ts, end_ts FROM sessions WHERE user_id = ? AND start_ts < ? AND end_ts > ? AND status != 'deleted' AND type_source IN ('confirmed','corrected')",
+    ).bind(userId, dayStart + DAY, dayStart).all<{ start_ts: number; end_ts: number }>()
+    const reviewed = (keepRev ?? []) as { start_ts: number; end_ts: number }[]
+    const overlapsReviewed = (s: { start_ts: number; end_ts: number }) =>
+      reviewed.some((k) => s.start_ts < k.end_ts && s.end_ts > k.start_ts)
     statements.push(
-      db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND status != 'deleted'")
+      db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND COALESCE(type_source,'model') NOT IN ('confirmed','corrected') AND status != 'deleted'")
         .bind(userId, dayStart, dayStart + DAY),
     )
     for (const s of sessions) {
+      if (overlapsReviewed(s)) continue
       const sid = `${userId}:${s.start_ts}`
       statements.push(db.prepare(
         'INSERT INTO sessions (user_id, id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, confidence, status, source, segments, detected_type, type_confidence, type_source) ' +
