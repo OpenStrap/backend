@@ -7,42 +7,22 @@ import { rollupMinutes } from './rollup'
 import { perMinuteSignals } from './ingest_signals'
 import { writeBatch } from './minute_store'
 
-// ── Rate limiting: per-user token bucket in a D1 row (RESILIENCE §7). ──
-// Refill RATE tokens/sec, cap BURST. One ingest = one token. Over budget → 429.
-const RL_BURST = 30          // allow short bursts (bulk reconnect upload)
-const RL_REFILL = 0.5        // 0.5 tokens/sec ≈ 30 batches/min sustained
-
-export async function checkRateLimit(db: D1Database, userId: string): Promise<boolean> {
-  const now = Math.floor(Date.now() / 1000)
-  const row = await db.prepare(
-    'SELECT tokens, updated_at FROM rate_limit WHERE user_id = ?',
-  ).bind(userId).first<{ tokens: number; updated_at: number }>()
-
-  let tokens = RL_BURST
-  if (row) {
-    const elapsed = Math.max(0, now - row.updated_at)
-    tokens = Math.min(RL_BURST, row.tokens + elapsed * RL_REFILL)
-  }
-  if (tokens < 1) {
-    // Persist the (refilled-but-still-empty) state so the clock keeps ticking.
-    await db.prepare(
-      'INSERT INTO rate_limit (user_id, tokens, updated_at) VALUES (?,?,?) ' +
-      'ON CONFLICT(user_id) DO UPDATE SET tokens=excluded.tokens, updated_at=excluded.updated_at',
-    ).bind(userId, tokens, now).run()
-    return false
-  }
-  tokens -= 1
-  await db.prepare(
-    'INSERT INTO rate_limit (user_id, tokens, updated_at) VALUES (?,?,?) ' +
-    'ON CONFLICT(user_id) DO UPDATE SET tokens=excluded.tokens, updated_at=excluded.updated_at',
-  ).bind(userId, tokens, now).run()
-  return true
-}
+// ── Rate limiting: native Workers Rate-Limiting binding (in-memory at the edge,
+// per-colo). Replaces the old D1 token-bucket, which cost 1 D1 read + 1 D1 WRITE on
+// EVERY ingest POST to maintain a bucket that — at 60s batching — never actually
+// throttled legitimate traffic (it fully refilled between posts). The binding has no
+// D1 I/O and no separate billing. Limit kept equivalent to the old 30/min (limit 30 /
+// 60s, configured as `simple` in wrangler). Per-colo + approximate, which is exactly
+// right for abuse/burst protection. Guarded so the worker still runs if the binding
+// isn't configured on a given environment (then ingest is unthrottled — the edge
+// already self-throttles to ~1 POST/min).
+interface RateLimiter { limit(opts: { key: string }): Promise<{ success: boolean }> }
 
 interface IngestEnv {
   DB: D1Database
   RAW_BUCKET: R2Bucket
   ANALYTICS_Q?: Queue
+  RATE_LIMITER?: RateLimiter
 }
 
 // Mark the user dirty so the NEXT 30-min cron sweep enqueues exactly ONE analytics
@@ -52,9 +32,15 @@ interface IngestEnv {
 // sweep per user per 30 min. Freshness is bounded by the sweep interval (fine — and
 // recovery still fires promptly on wake via the sleep-detection trigger).
 async function markUserDirty(env: IngestEnv, userId: string) {
+  // Cost: `dirty` stays 1 from the first ingest until the wake-close clears it, so an
+  // unconditional upsert bills a D1 ROW WRITE on every batch (~1,440/user/day) to set a
+  // flag that's already 1. The conditional DO UPDATE writes a row ONLY on the real 0→1
+  // transition (first ingest of a new cycle / after a close) — steady-state batches hit
+  // the WHERE=false path and write 0 rows (just a cheap PK read). ~1 dirty-write per
+  // wake-cycle instead of per-POST, cutting ingest D1 writes ~1/3. Same observable state.
   await env.DB.prepare(
     'INSERT INTO analytics_cursor (user_id, last_min_ts, dirty) VALUES (?,0,1) ' +
-    'ON CONFLICT(user_id) DO UPDATE SET dirty = 1',
+    'ON CONFLICT(user_id) DO UPDATE SET dirty = 1 WHERE analytics_cursor.dirty = 0',
   ).bind(userId).run()
 }
 
@@ -64,28 +50,20 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
   const { device_id, records } = await c.req.json<{ device_id: string; records: string[] }>()
   if (!device_id || !Array.isArray(records)) return c.json({ error: 'Invalid payload' }, 400)
 
-  // 1. Rate limit.
-  if (!(await checkRateLimit(c.env.DB, userId))) {
-    return c.json({ error: 'Rate limit exceeded' }, 429)
+  // 1. Rate limit (edge binding; no D1). Skipped if the binding isn't configured.
+  if (c.env.RATE_LIMITER) {
+    const { success } = await c.env.RATE_LIMITER.limit({ key: userId })
+    if (!success) return c.json({ error: 'Rate limit exceeded' }, 429)
   }
 
   // 2. Decode.
   const samples = decodeBatch(records)
 
-  // 3. R2 put the whole batch raw (re-decodable system of record).
-  let rawKey: string | null = null
-  if (records.length > 0) {
-    const tss = samples.map((s) => s.ts).filter((t) => t > 0)
-    const minTs = tss.length ? Math.min(...tss) : 0
-    const maxTs = tss.length ? Math.max(...tss) : 0
-    rawKey = `raw/${userId}/${device_id}/${Date.now()}-${minTs}-${maxTs}.txt`
-    try {
-      await c.env.RAW_BUCKET.put(rawKey, records.join('\n'))
-    } catch (e) {
-      console.error('R2 put failed', e)
-      rawKey = null
-    }
-  }
+  // 3. (Raw R2 archive removed.) Decoders are validated, and every surfaced signal —
+  //    HR/RR/HRV, steps, SpO₂/temp, and PPG-resp (via the R21 green RIIV proxy) — is now
+  //    derived at ingest and stored in the D1 minute blob, so there is nothing to
+  //    re-decode from raw later. RAW_BUCKET is retained ONLY for the hot/seal tier
+  //    (sealOldDays moves aged minute_day blobs to R2); no per-POST raw object is written.
 
   // 4. Rollup → day-packed minute store (ONE row per day, read-merge-write). This is
     // the cost lever: ~1 row written/day instead of ~1,440. The merge inside writeBatch
@@ -109,16 +87,15 @@ export async function ingestBatch(c: Context<{ Bindings: IngestEnv; Variables: {
   // 6. Enqueue analytics (or mark dirty). Never run inline.
   if (minutesWritten > 0) await markUserDirty(c.env, userId)
 
-  // 7. Respond. `received` = records persisted raw to R2 (the re-decodable system of
-  //    record); `decoded` = records that yielded a surfaceable sample; `minutes_written`
-  //    = per-minute rollups touched. The client shows `received` so the count is honest
-  //    (a 2xx means we stored them all), not 0.
+  // 7. Respond. `received` = records accepted (a 2xx means we decoded + rolled them into
+  //    the D1 minute store); `decoded` = records that yielded a surfaceable sample;
+  //    `minutes_written` = per-minute rollups touched. The client shows `received` so the
+  //    count is honest, not 0.
   return c.json({
     ok: true,
     received: records.length,
     decoded: samples.length,
     minutes_written: minutesWritten,
-    raw_key: rawKey,
   })
 }
 

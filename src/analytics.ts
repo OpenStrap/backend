@@ -11,7 +11,7 @@ import {
   stageHypnogram,
   calcSleepRegularity, detectSessions, calcLoad, calcFitnessTrend,
   calcVo2Max, calcFitnessModel, calcMonotony,
-  calcAnomaly, calcBaselines, buildCoach,
+  calcAnomaly, calcBaselines, buildCoach, calcCycle, calcRestlessness,
   calcSleepStress, calcNocturnalHeart, buildNotifications,
   type Minute, type Profile, type Baseline, type DayHistory,
   type DailyStrain, type NightSummary, type SleepValue, type Metric, type Driver,
@@ -33,6 +33,7 @@ interface MinuteRow {
   activity: number | null
   steps: number | null
   wrist_on: number | null
+  act_class?: string | null
 }
 
 const toMinute = (r: MinuteRow): Minute => ({
@@ -44,6 +45,7 @@ const toMinute = (r: MinuteRow): Minute => ({
   activity: r.activity ?? 0,
   steps: r.steps ?? 0,
   wrist_on: !!r.wrist_on,
+  ...(r.act_class ? { act_class: r.act_class as Minute['act_class'] } : {}),
 })
 
 // Build a per-metric flag entry from any Metric<T>.
@@ -321,6 +323,18 @@ export async function processUser(
     }
   }
 
+  // Cycle-phase context (gated on track_cycle) so a luteal RHR/temp rise doesn't
+  // false-fire the anomaly signal. Loaded once; phase computed per-day below.
+  let cycleStarts: string[] = []
+  const trackRow = await db.prepare('SELECT track_cycle FROM users WHERE id = ?')
+    .bind(userId).first<{ track_cycle: number | null }>()
+  if (trackRow?.track_cycle) {
+    const { results } = await db.prepare(
+      "SELECT date FROM cycle_log WHERE user_id = ? AND kind = 'start' ORDER BY date",
+    ).bind(userId).all<{ date: string }>()
+    cycleStarts = (results ?? []).map((r) => r.date)
+  }
+
   for (let dayStart = firstDayStart; dayStart <= lastDayStart; dayStart += DAY) {
     const date = dayKey(dayStart)
     const dayMin = dayMinutes(dayStart)
@@ -376,19 +390,35 @@ export async function processUser(
     // user-owned and must survive a re-derive. Deleted tombstones are KEPT so a
     // user-deleted auto session isn't resurrected (its row's status stays
     // 'deleted'; the re-insert below only updates non-status fields via ON CONFLICT).
+    // ALSO preserve any auto session the user CONFIRMED/CORRECTED (the calibration
+    // ledger): exclude it from the DELETE and skip an overlapping re-detection so a
+    // baseline-drift start_ts shift can't insert a duplicate that re-overwrites the
+    // user's label. (Without this, every re-derive wiped user corrections.)
+    const { results: keepRev } = await db.prepare(
+      "SELECT start_ts, end_ts FROM sessions WHERE user_id = ? AND start_ts < ? AND end_ts > ? AND status != 'deleted' AND type_source IN ('confirmed','corrected')",
+    ).bind(userId, dayStart + DAY, dayStart).all<{ start_ts: number; end_ts: number }>()
+    const reviewed = (keepRev ?? []) as { start_ts: number; end_ts: number }[]
+    const overlapsReviewed = (s: { start_ts: number; end_ts: number }) =>
+      reviewed.some((k) => s.start_ts < k.end_ts && s.end_ts > k.start_ts)
     statements.push(
-      db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND status != 'deleted'")
+      db.prepare("DELETE FROM sessions WHERE user_id = ? AND start_ts >= ? AND start_ts < ? AND (source IS NULL OR source = 'auto') AND COALESCE(type_source,'model') NOT IN ('confirmed','corrected') AND status != 'deleted'")
         .bind(userId, dayStart, dayStart + DAY),
     )
     for (const s of sessions) {
+      if (overlapsReviewed(s)) continue
       const sid = `${userId}:${s.start_ts}`
       statements.push(db.prepare(
-        'INSERT INTO sessions (user_id, id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, confidence, status, source) ' +
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'done','auto') ON CONFLICT(user_id, id) DO UPDATE SET " +
-        'end_ts=excluded.end_ts, type=excluded.type, avg_hr=excluded.avg_hr, max_hr=excluded.max_hr, ' +
-        'strain=excluded.strain, calories=excluded.calories, hrr60=excluded.hrr60, zones=excluded.zones, confidence=excluded.confidence',
+        'INSERT INTO sessions (user_id, id, start_ts, end_ts, type, avg_hr, max_hr, strain, calories, hrr60, zones, confidence, status, source, segments, detected_type, type_confidence, type_source) ' +
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'done','auto',?,?,?,'model') ON CONFLICT(user_id, id) DO UPDATE SET " +
+        'end_ts=excluded.end_ts, avg_hr=excluded.avg_hr, max_hr=excluded.max_hr, ' +
+        'strain=excluded.strain, calories=excluded.calories, hrr60=excluded.hrr60, zones=excluded.zones, confidence=excluded.confidence, ' +
+        'segments=excluded.segments, detected_type=excluded.detected_type, ' +
+        // Preserve a user-confirmed/corrected type across re-derivation; only the model fields refresh.
+        'type_confidence=CASE WHEN sessions.type_source IN (\'confirmed\',\'corrected\') THEN sessions.type_confidence ELSE excluded.type_confidence END, ' +
+        'type=CASE WHEN sessions.type_source IN (\'confirmed\',\'corrected\') THEN sessions.type ELSE excluded.type END',
       ).bind(userId, sid, s.start_ts, s.end_ts, s.type, Math.round(s.avg_hr), Math.round(s.max_hr),
-        s.strain, s.kcal, s.hrr60 == null ? null : Math.round(s.hrr60), JSON.stringify(s.zones), s.confidence))
+        s.strain, s.kcal, s.hrr60 == null ? null : Math.round(s.hrr60), JSON.stringify(s.zones), s.confidence,
+        s.segments ? JSON.stringify(s.segments) : null, s.detected_type ?? s.type, s.type_confidence))
     }
 
     // -- Wear time (worn minutes). --
@@ -409,6 +439,9 @@ export async function processUser(
     // -- Sleep stress / nocturnal arousal (HR surges + motion in sleep; NOT HRV;
     //    the HRV-based daytime stress is computed in biometrics.ts from RR). --
     const sleepStress = calcSleepStress(sleepWorn, baseline)
+    // -- Restlessness (movement fragmentation; distinct from arousal). Folded into the
+    //    sleep_stress JSON so no new column / upsert change is needed. --
+    const restlessness = calcRestlessness(sleepWorn)
 
     // -- Main-metric drivers (the cross-metric "what affected this" graph). --
     const mainDrivers: Record<string, Driver[]> = {
@@ -471,7 +504,7 @@ export async function processUser(
       // idx points into the parallel arrays, which now START with `seedLen`
       // seeded history days — so trailing slices in Pass 3 reach into real history.
       date, dayStart, idx: seedLen + dayBuffer.length, rhr, strain, zones, calories, sleep, wearMin, daySteps,
-      sleepStress: JSON.stringify(sleepStress),
+      sleepStress: JSON.stringify({ ...sleepStress, restlessness }),
       nocturnal: JSON.stringify(nocturnal),
       sleepingHr: nocturnal.sleeping_hr_avg,
       nocturnalElevated: nocturnal.elevated,
@@ -523,12 +556,13 @@ export async function processUser(
     // Readiness + HRV CV/irregular are owned by biometrics.ts (HRV is fresh there).
     const nocDip = (() => { try { return JSON.parse(nocturnal)?.dip_pct ?? null } catch { return null } })()
 
+    const cyclePhase = cycleStarts.length ? calcCycle(cycleStarts, date).phase : null
     const anomaly = calcAnomaly({
       recent_rhr: recentRhr,
       skin_temp: baseline.skin_temp ?? null,
       sleep_efficiency: sleep.efficiency != null ? sleep.efficiency : null, // keep a real 0% (not coerced to "no data")
       baseline_sleep_efficiency: null,
-    }, baseline)
+    }, baseline, { cyclePhase })
 
     const flags = JSON.stringify({
       strain: flag(strain, 'Strain'),

@@ -12,19 +12,18 @@ import { getHistory } from './history'
 import { postJournal, getJournal, getJournalInsights } from './journal'
 import { postCycleLog, deleteCycleLog, getCycle } from './cycle'
 import { postSpotCheck } from './spotcheck'
-import { getDayStrain, getDaySleep, getDaySleepV2, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear } from './daydetail'
+import { getDayStrain, getDaySleep, getDaySleepV2, getDayTimeline, getDayStress, getDayHeart, getDayLungs, getDayWear, getDayHrv } from './daydetail'
 import { getTrend } from './trend'
-import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts } from './workouts'
+import { workoutStart, workoutEnd, listWorkouts, getWorkout, deleteWorkout, autoCloseStaleWorkouts, setWorkoutType, sweepWorkoutDetection } from './workouts'
 import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
-import { runRespRate } from './resp'
-import { runBiometrics } from './biometrics'
 import { getAppStatus, adminGetConfig, adminSetConfig } from './appconfig'
 import { seedInit, seedMinutes, seedAnalytics } from './seed'
 
 type Bindings = {
   DB: D1Database
   RAW_BUCKET: R2Bucket
+  RATE_LIMITER?: { limit(opts: { key: string }): Promise<{ success: boolean }> }
   ANALYTICS_Q?: Queue<AnalyticsMessage>
   JWT_SECRET: string
   ADMIN_TOKEN?: string
@@ -255,12 +254,14 @@ app.get('/day/timeline', getDayTimeline)
 app.get('/day/stress', getDayStress)
 app.get('/day/heart', getDayHeart)
 app.get('/day/lungs', getDayLungs)
+app.get('/day/hrv', getDayHrv)
 app.get('/day/wear', getDayWear)
 app.get('/trend/:metric', getTrend)
 app.post('/workout/start', workoutStart)
 app.post('/workout/end', workoutEnd)
 app.get('/workouts', listWorkouts)
 app.get('/workout/:id', getWorkout)
+app.post('/workout/:id/type', setWorkoutType)
 app.delete('/workout/:id', deleteWorkout)
 app.get('/records', getRecords)
 app.get('/notifications', getNotifications)
@@ -272,57 +273,18 @@ app.post('/notifications/read', markNotificationsRead)
 app.get('/admin/config', adminGetConfig)
 app.post('/admin/config', adminSetConfig)
 
-// Raw R2 objects auto-expire after this many days (bucket lifecycle rule
-// `expire-raw-14d`). The R2-re-decode jobs (HRV/resp/IMU steps) can therefore
-// only run over data this recent — older raw is gone, so we cap their `days`
-// here. Keep this in sync with the R2 lifecycle rule.
-const RAW_RETENTION_DAYS = 14
-
+// [drop-r2] re-derive analytics from D1 (no R2). HRV/resp/optical land at the wake-close
+// (close_day → runBiometricsMinute); to recompute them for a user, enqueue close_day via
+// /admin/enqueue. This endpoint just re-runs the D1 daily/sleep/strain derivation.
 app.post('/admin/run-analytics', async (c) => {
-  const body = await c.req.json<{ user_id?: string; days?: number; bio?: boolean }>().catch(() => ({} as any))
+  const body = await c.req.json<{ user_id?: string; days?: number }>().catch(() => ({} as any))
   const days = body.days ?? 3
-  // Biometrics re-decodes from R2 → can only go back as far as raw is retained.
-  const bioDays = Math.min(days, RAW_RETENTION_DAYS)
   if (body.user_id) {
-    // Full re-derive sequence so HRV recovery feeds the coach:
-    //   1. processUser  — minute metrics (strain/RHR/sleep/sessions...) + daily rows
-    //      (reads the `minute` table, retained 90d — not R2 — so `days` is unbounded here)
-    //   2. runBiometrics — HRV recovery/stress/illness from RR (R2; capped to retention)
-    //   3. processUser  — coach picks up the recovery written in step 2
     const r1 = await processUser(c.env.DB, body.user_id, { historyDays: days })
-    let bio: any = null
-    if (body.bio !== false) {
-      bio = await runBiometrics(c.env, body.user_id, bioDays)
-      await processUser(c.env.DB, body.user_id, { historyDays: days })
-    }
-    return c.json({ ok: true, ...r1, bio, bio_days: bioDays, bio_capped: bioDays < days })
+    return c.json({ ok: true, ...r1 })
   }
   const res = await runAnalytics(c.env.DB, { historyDays: days })
   return c.json({ ok: true, ...res })
-})
-
-// Respiratory rate from PPG (R21 re-decoded from R2). Heavy (R2 reads) → admin /
-// cron only. Stores resp_rate/resp_conf on daily; gated (conf ≥ 0.5) before surfaced.
-// `days` is capped to the R2 retention window (older raw no longer exists).
-app.post('/admin/run-resp', async (c) => {
-  const body = await c.req.json<{ user_id: string; days?: number }>().catch(() => ({} as any))
-  if (!body.user_id) return c.json({ error: 'user_id required' }, 400)
-  const reqDays = body.days ?? 3
-  const days = Math.min(reqDays, RAW_RETENTION_DAYS)
-  const res = await runRespRate(c.env, body.user_id, days)
-  return c.json({ ok: true, ...res, capped: days < reqDays, max_days: RAW_RETENTION_DAYS })
-})
-
-// HRV (RMSSD) + relative skin-temp / SpO₂ from the V24 RR/ADC bytes, re-decoded
-// from R2. Heavy (R2 reads) → admin / cron only. Writes daily.hrv_rmssd etc.
-// `days` is capped to the R2 retention window (older raw no longer exists).
-app.post('/admin/run-biometrics', async (c) => {
-  const body = await c.req.json<{ user_id: string; days?: number }>().catch(() => ({} as any))
-  if (!body.user_id) return c.json({ error: 'user_id required' }, 400)
-  const reqDays = body.days ?? 3
-  const days = Math.min(reqDays, RAW_RETENTION_DAYS)
-  const res = await runBiometrics(c.env, body.user_id, days)
-  return c.json({ ok: true, ...res, capped: days < reqDays, max_days: RAW_RETENTION_DAYS })
 })
 
 // (Steps are AN-2554-only now: counted at ingest into minute.steps, summed into
@@ -397,11 +359,14 @@ app.post('/admin/enqueue', async (c) => {
   return c.json({ ok: true, enqueued: msg })
 })
 
+// Clean up the legacy raw/ namespace ONLY. Per-POST raw archival was removed; existing
+// raw/ objects also self-expire via the bucket lifecycle rule. This is prefix-scoped so
+// it can NEVER touch the sealed minute/ blobs (the hot/seal cold tier we still use).
 app.post('/admin/wipe-raw', async (c) => {
   let deleted = 0
   let cursor: string | undefined
   do {
-    const listing = await c.env.RAW_BUCKET.list({ cursor, limit: 1000 })
+    const listing = await c.env.RAW_BUCKET.list({ prefix: 'raw/', cursor, limit: 1000 })
     const keys = listing.objects.map((o) => o.key)
     if (keys.length > 0) {
       await c.env.RAW_BUCKET.delete(keys)
@@ -412,7 +377,7 @@ app.post('/admin/wipe-raw', async (c) => {
   return c.json({ deleted })
 })
 
-// Prune minute rows older than 90 days (raw stays in R2).
+// Prune minute rows older than retention (sealed minute blobs stay in R2).
 app.post('/admin/prune', async (c) => {
   const now = Math.floor(Date.now() / 1000)
   await pruneMinuteDays(c.env, now, MINUTE_RETENTION_DAYS) // day-packed minute_day rows
@@ -441,6 +406,10 @@ export default {
       // the nightly tick keeps autoCloseStaleWorkouts as a safety net for users who
       // never open the app.
       try { await runWakeLadder(env) } catch (e) { console.error('wake ladder failed', e) }
+      // #D incremental workout detection: re-derive TODAY's auto-workouts for users who
+      // ingested since their last close, so workouts surface ~one tick after they end
+      // even with the app closed. Throttled per-user + bounded; no hot-path cost.
+      try { await sweepWorkoutDetection(env) } catch (e) { console.error('wkt sweep failed', e) }
       // Nightly maintenance ONLY (separate from detection): seal + retention + retry-net.
       if (event.cron === '30 3 * * *') {
         try { await autoCloseStaleWorkouts(env.DB) } catch (e) { console.error('autoclose failed', e) }
