@@ -242,3 +242,38 @@ CREATE TABLE IF NOT EXISTS app_config(
   updated_at        INTEGER
 );
 INSERT OR IGNORE INTO app_config (id) VALUES (1);
+
+-- ── STRAVA (bidirectional sync) ───────────────────────────────────────────────
+-- OAuth tokens per user. access_token is short-lived; refresh via refresh_token.
+CREATE TABLE IF NOT EXISTS strava_tokens(
+  user_id TEXT PRIMARY KEY,
+  athlete_id INTEGER,
+  access_token TEXT NOT NULL,
+  refresh_token TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,     -- unix seconds; refresh when now >= this
+  scope TEXT,
+  connected_at INTEGER
+);
+-- Activities pulled from Strava (Strava → Whoop), kept for the in-app overlay.
+CREATE TABLE IF NOT EXISTS strava_activities(
+  user_id TEXT NOT NULL,
+  activity_id INTEGER NOT NULL,    -- Strava's activity id
+  start_ts INTEGER,                -- unix seconds (UTC)
+  elapsed_sec INTEGER,
+  type TEXT,
+  name TEXT,
+  distance_m REAL,
+  avg_hr REAL, max_hr REAL,
+  raw TEXT,                        -- the JSON summary, for later enrichment
+  pulled_at INTEGER,
+  PRIMARY KEY(user_id, activity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_strava_act_user ON strava_activities(user_id, start_ts);
+-- Which OpenStrap sessions we've pushed to Strava (Whoop → Strava dedupe).
+CREATE TABLE IF NOT EXISTS strava_pushed(
+  user_id TEXT NOT NULL,
+  session_key TEXT NOT NULL,
+  activity_id INTEGER,
+  pushed_at INTEGER,
+  PRIMARY KEY(user_id, session_key)
+);
