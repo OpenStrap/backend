@@ -19,6 +19,8 @@ import { getRecords } from './records'
 import { getNotifications, markNotificationsRead } from './notifications'
 import { getAppStatus, adminGetConfig, adminSetConfig } from './appconfig'
 import { seedInit, seedMinutes, seedAnalytics } from './seed'
+import { coachChatCompletions, coachModels, type AiBinding } from './coach'
+import { stravaConnect, stravaCallback, stravaStatus, stravaDisconnect, stravaSync, stravaActivities, syncAllStrava } from './strava'
 
 type Bindings = {
   DB: D1Database
@@ -27,6 +29,10 @@ type Bindings = {
   ANALYTICS_Q?: Queue<AnalyticsMessage>
   JWT_SECRET: string
   ADMIN_TOKEN?: string
+  AI: AiBinding              // Cloudflare Workers AI (self-hosted AI Coach)
+  COACH_KEY?: string         // bearer the in-app AI Coach uses for /coach/v1/*
+  STRAVA_CLIENT_ID?: string  // Strava API app credentials (bidirectional sync)
+  STRAVA_CLIENT_SECRET?: string
   BREVO_API_KEY?: string
   RESEND_API_KEY?: string
   EMAIL_FROM?: string
@@ -66,6 +72,22 @@ const requireAdmin = async (c: any, next: any) => {
   }
   await next()
 }
+
+// ---------- self-hosted AI Coach (OpenAI-compatible, Workers AI) ----------
+// Auth is the COACH_KEY bearer, checked inside the handlers (not requireJwt) so the
+// app's BYOK AI-Coach client can point its base URL at `<backend>/coach/v1`.
+app.post('/coach/v1/chat/completions', coachChatCompletions)
+app.get('/coach/v1/models', coachModels)
+
+// ---------- Strava (bidirectional sync) ----------
+// /connect, /status, /disconnect need the user JWT; /callback is Strava's public
+// redirect target (auth is the signed `state` it round-trips).
+app.get('/strava/connect', requireJwt, stravaConnect)
+app.get('/strava/callback', stravaCallback)
+app.get('/strava/status', requireJwt, stravaStatus)
+app.post('/strava/disconnect', requireJwt, stravaDisconnect)
+app.get('/strava/sync', requireJwt, stravaSync)
+app.get('/strava/activities', requireJwt, stravaActivities)
 
 app.use('/ingest/*', requireJwt)
 app.use('/profile', requireJwt)
@@ -421,6 +443,8 @@ export default {
         await pruneMinuteDays(env, nowS, MINUTE_RETENTION_DAYS)
         await env.DB.prepare('DELETE FROM events WHERE ts < ?').bind(nowS - MINUTE_RETENTION_DAYS * DAY).run()
         try { await retryStaleCloses(env) } catch (e) { console.error('retry-net failed', e) }
+        // Strava: pull new activities (incl. Wahoo rides) + push non-duplicate workouts.
+        try { await syncAllStrava(env) } catch (e) { console.error('strava sync failed', e) }
       }
     })())
   },

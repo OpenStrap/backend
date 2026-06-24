@@ -11,7 +11,7 @@ import {
   stageHypnogram,
   calcSleepRegularity, detectSessions, calcLoad, calcFitnessTrend,
   calcVo2Max, calcFitnessModel, calcMonotony,
-  calcAnomaly, calcBaselines, buildCoach, calcCycle, calcRestlessness,
+  calcAnomaly, calcBaselines, seedBaselines, buildCoach, calcCycle, calcRestlessness,
   calcSleepStress, calcNocturnalHeart, buildNotifications,
   type Minute, type Profile, type Baseline, type DayHistory,
   type DailyStrain, type NightSummary, type SleepValue, type Metric, type Driver,
@@ -181,6 +181,20 @@ export async function processUser(
   const lastDayStart = oldestDayStart + (dTo - 1) * DAY
 
   const profile = await loadProfile(db, userId)
+
+  // Seed population/profile-prior baselines on the first-ever run (INSERT OR IGNORE
+  // → only when no row exists). Gives strain/HR-zones a personal resting/max HR from
+  // day 1 and warm-starts the EWMA autonomic baselines (RMSSD/sleeping-HR/SI) from
+  // physiological norms instead of cold. Real measured data overwrites these: the
+  // calcBaselines medians below, the nightly EWMA rolls, and the ≥5-night gated
+  // scores (recovery/stress) — which still need real nights and are never faked.
+  const seed = seedBaselines(profile)
+  await db.prepare(
+    'INSERT OR IGNORE INTO baselines (user_id, resting_hr, max_hr, sleep_need_min, hrv_rmssd, sleeping_hr, resp_rate, hrv_si, updated_at) ' +
+    'VALUES (?,?,?,?,?,?,?,?,?)',
+  ).bind(userId, seed.resting_hr, seed.max_hr, seed.sleep_need_min, seed.hrv_rmssd,
+    seed.sleeping_hr, seed.resp_rate, seed.hrv_si, now).run()
+
   let baseline = await loadBaseline(db, userId)
 
   // HRV recovery (computed in biometrics.ts from RR) is read back here to drive

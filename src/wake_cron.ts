@@ -12,7 +12,7 @@
 import { detectWakeState, peekRecentState } from 'openstrap-analytics'
 import { loadMinutes, loadBaseline } from './analytics'
 import { loadDayRr } from './dayseries'
-import type { AnalyticsMessage } from './queue'
+import { closeDay, type AnalyticsMessage } from './queue'
 
 interface WakeEnv { DB: D1Database; RAW_BUCKET?: R2Bucket; ANALYTICS_Q?: Queue<AnalyticsMessage> }
 
@@ -71,6 +71,12 @@ export async function runWakeLadder(
         user_id: u.user_id, job: 'close_day', day: dayLabel,
         onset_ts: ws.onset_ts ?? undefined, wake_ts: ws.wake_ts,
       })
+    } else {
+      // [free-tier] No queue bound (Workers Free): derive the day INLINE. At most one
+      // user is closed per tick, so this stays well under the 1000 Cloudflare-subrequest
+      // cap. Without this the day would be marked closed but never actually computed.
+      try { await closeDay({ DB: env.DB, RAW_BUCKET: env.RAW_BUCKET as R2Bucket }, u.user_id, dayLabel, ws.onset_ts ?? undefined, ws.wake_ts) }
+      catch (e) { console.error('inline close_day failed', u.user_id, dayLabel, e) }
     }
     closed++
   }
@@ -87,6 +93,11 @@ export async function retryStaleCloses(env: WakeEnv, now = Math.floor(Date.now()
   let n = 0
   for (const u of results ?? []) {
     if (env.ANALYTICS_Q) { await env.ANALYTICS_Q.send({ user_id: u.user_id, job: 'sweep' }); n++ }
+    else {
+      // [free-tier] No queue: re-derive inline as the nightly retry-net backstop.
+      try { await closeDay({ DB: env.DB, RAW_BUCKET: env.RAW_BUCKET as R2Bucket }, u.user_id) } catch (e) { console.error('inline retry close failed', u.user_id, e) }
+      n++
+    }
   }
   return n
 }

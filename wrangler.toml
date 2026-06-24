@@ -12,22 +12,31 @@ database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 binding = "RAW_BUCKET"
 bucket_name = "openstrap-raw"
 
-# Analytics queue (producer + consumer). ENABLED on Workers Paid. The cron just
-# ENQUEUES one (user, job) message per unit of work; the consumer processes one
-# bounded unit per invocation, so heavy R2 jobs (biometrics/resp/steps) never hit
-# the 1000-subrequest per-invocation cap. ingest.ts also enqueues a 'sweep' on
-# upload (falls back to analytics_cursor.dirty=1 if the binding is absent).
-# max_batch_size = 1 → exactly one (user, job) per invocation (guaranteed bounded).
-[[queues.producers]]
-binding = "ANALYTICS_Q"
-queue = "openstrap-analytics"
+# Workers AI — powers the self-hosted, OpenAI-compatible AI Coach (src/coach.ts).
+# No external key; runs within Cloudflare's free daily AI allocation.
+[ai]
+binding = "AI"
 
-[[queues.consumers]]
-queue = "openstrap-analytics"
-max_batch_size = 1
-max_batch_timeout = 10
-max_retries = 3
-dead_letter_queue = "openstrap-analytics-dlq"
+# Analytics queue (producer + consumer). Cloudflare Queues require the Workers PAID
+# plan ($5/mo). DISABLED here so this deploys on the FREE plan. With no ANALYTICS_Q
+# binding, the cron derives each day INLINE instead of enqueuing (see wake_cron.ts /
+# queue.ts closeDay) — fine for a personal single-user backend (one close per tick,
+# well under the free plan's 1000 Cloudflare-subrequest cap).
+#
+# To re-enable on Workers Paid: uncomment the four blocks below and
+#   npx wrangler queues create openstrap-analytics
+#   npx wrangler queues create openstrap-analytics-dlq
+#
+# [[queues.producers]]
+# binding = "ANALYTICS_Q"
+# queue = "openstrap-analytics"
+#
+# [[queues.consumers]]
+# queue = "openstrap-analytics"
+# max_batch_size = 1
+# max_batch_timeout = 10
+# max_retries = 3
+# dead_letter_queue = "openstrap-analytics-dlq"
 
 # Crons: 30-min sweep (re-derive dirty users → keeps "today" fresh; pure-read
 # endpoints serve this snapshot) + nightly full re-derive/prune. Any non-nightly

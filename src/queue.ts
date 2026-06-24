@@ -28,25 +28,33 @@ interface QueueEnv {
   ANALYTICS_Q?: Queue<AnalyticsMessage>
 }
 
+// [free-tier] Close one physiological day for one user. Exported so the cron can run
+// this INLINE when no queue is bound (Cloudflare Queues require Workers Paid). All work
+// is D1 + (optional) R2 reads — well under the free plan's 1000 Cloudflare-subrequest
+// cap for a single user. Mirrors the 'close_day' queue branch exactly.
+export async function closeDay(env: QueueEnv, userId: string, day?: string, onset_ts?: number, wake_ts?: number): Promise<void> {
+  // [wake-trigger] fired ONCE per physiological day when the user wakes. Derives
+  // the day (sleep/naps/strain/sessions/baselines/coach via processUser) and folds
+  // in HRV/recovery from D1 minute.rr — zero R2. Then invalidates the day's Tier-2
+  // cache and clears the dirty flag (daytime ingests re-set it; the cron skips
+  // awake-and-closed users by last_close_date, so no churn).
+  // processUser derives the day AND folds daily.steps = SUM(minute.steps) (AN-2554
+  // counted at ingest) — no separate step job.
+  await processUser(env.DB, userId, { historyDays: 3 })
+  if (day && wake_ts) {
+    const from = onset_ts ?? (wake_ts - 8 * 3600)
+    try { await runBiometricsMinute({ DB: env.DB, RAW_BUCKET: env.RAW_BUCKET }, userId, day, from, wake_ts + 60) } catch (e) { console.error('biometrics_minute failed', userId, day, e) }
+    await invalidateDay(env.DB, userId, day)
+  }
+  await env.DB.prepare('UPDATE analytics_cursor SET dirty = 0 WHERE user_id = ?').bind(userId).run()
+}
+
 // Run one bounded unit of work. Each branch is sized to fit in a single
 // invocation's budget (one user, one job, a few days of R2 at most).
 async function runJob(env: QueueEnv, userId: string, job: AnalyticsJob, day?: string, onset_ts?: number, wake_ts?: number): Promise<void> {
   switch (job) {
     case 'close_day':
-      // [wake-trigger] fired ONCE per physiological day when the user wakes. Derives
-      // the day (sleep/naps/strain/sessions/baselines/coach via processUser) and folds
-      // in HRV/recovery from D1 minute.rr — zero R2. Then invalidates the day's Tier-2
-      // cache and clears the dirty flag (daytime ingests re-set it; the cron skips
-      // awake-and-closed users by last_close_date, so no churn).
-      // processUser derives the day AND folds daily.steps = SUM(minute.steps) (AN-2554
-      // counted at ingest) — no separate step job.
-      await processUser(env.DB, userId, { historyDays: 3 })
-      if (day && wake_ts) {
-        const from = onset_ts ?? (wake_ts - 8 * 3600)
-        try { await runBiometricsMinute({ DB: env.DB, RAW_BUCKET: env.RAW_BUCKET }, userId, day, from, wake_ts + 60) } catch (e) { console.error('biometrics_minute failed', userId, day, e) }
-        await invalidateDay(env.DB, userId, day)
-      }
-      await env.DB.prepare('UPDATE analytics_cursor SET dirty = 0 WHERE user_id = ?').bind(userId).run()
+      await closeDay(env, userId, day, onset_ts, wake_ts)
       break
     case 'sweep':
     default:
