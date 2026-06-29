@@ -12,6 +12,8 @@ const SETTABLE = [
   'latest_version', 'latest_build', 'apk_url', 'release_notes', 'min_build',
   'banner_active', 'banner_id', 'banner_title', 'banner_text', 'banner_level',
   'banner_action_url',
+  // Terms & Privacy pointer (drives the onboarding consent gate).
+  'terms_version', 'terms_url', 'privacy_url', 'terms_summary',
 ] as const
 
 async function readConfig(db: D1Database): Promise<any> {
@@ -43,7 +45,27 @@ export async function getAppStatus(c: any) {
       }
     : null
 
-  return c.json({ update, banner })
+  // Live Terms/Privacy pointer so the consent screen always reflects the current
+  // version (the client records which version it accepted, and stamps it on data).
+  const terms = {
+    version: row.terms_version ?? 1,
+    url: row.terms_url ?? null,
+    privacy_url: row.privacy_url ?? null,
+    summary: row.terms_summary ?? null,
+  }
+
+  return c.json({ update, banner, terms })
+}
+
+/** GET /legal/terms (public) → just the current Terms/Privacy pointer. */
+export async function getTerms(c: any) {
+  const row = await readConfig(c.env.DB)
+  return c.json({
+    version: row?.terms_version ?? 1,
+    url: row?.terms_url ?? null,
+    privacy_url: row?.privacy_url ?? null,
+    summary: row?.terms_summary ?? null,
+  })
 }
 
 /** GET /admin/config → the raw row (admin convenience). */

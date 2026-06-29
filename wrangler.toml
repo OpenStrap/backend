@@ -1,40 +1,40 @@
-name = "openstrap-backend"
+name = "openstrap-companion"
 compatibility_date = "2024-04-01"
 
 main = "src/index.ts"
 
+# ── FREE-TIER BY DESIGN ───────────────────────────────────────────────────────
+# This slim companion is built to run entirely on the Cloudflare FREE plan.
+#   • NO Queues  — Queues require Workers Paid ($5/mo). The old backend pulled in
+#     the paid plan ONLY because of the analytics queue; it's gone now.
+#   • NO Cron triggers — the heavy nightly/sweep crons are gone (nothing to derive).
+#   • Workers Free: 100k req/day, request body ≤ 100 MB (matches the upload cap).
+#   • D1 Free: 5 GB, 5M row-reads + 100k row-writes/day.
+#   • R2 Free: 10 GB stored, 1M Class-A + 10M Class-B ops/mo, ZERO egress. Health
+#     uploads keep only the latest .db per device (see health.ts) to stay under 10 GB.
+#   • Rate limiting binding below is FREE (edge-local, no D1 cost).
+# Keep it this way: do NOT add [[queues.*]], [triggers], or Durable Objects.
+
+# Fresh v3 storage (empty) — does NOT touch the old v2 cloud DB/bucket.
 [[d1_databases]]
 binding = "DB"
-database_name = "openstrap-db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_name = "openstrap-v3-slim-db"
+database_id = "1ed30de4-9ff0-4486-9ac1-54cb3b181f57"
 
+# Health-data uploads (opt-in full local .db). R2 has its own free tier and works
+# on Workers Free. Create the bucket: `wrangler r2 bucket create openstrap-v3-health`.
 [[r2_buckets]]
-binding = "RAW_BUCKET"
-bucket_name = "openstrap-raw"
+binding = "HEALTH_BUCKET"
+bucket_name = "openstrap-v3-health"
 
-# Analytics queue (producer + consumer). ENABLED on Workers Paid. The cron just
-# ENQUEUES one (user, job) message per unit of work; the consumer processes one
-# bounded unit per invocation, so heavy R2 jobs (biometrics/resp/steps) never hit
-# the 1000-subrequest per-invocation cap. ingest.ts also enqueues a 'sweep' on
-# upload (falls back to analytics_cursor.dirty=1 if the binding is absent).
-# max_batch_size = 1 → exactly one (user, job) per invocation (guaranteed bounded).
-[[queues.producers]]
-binding = "ANALYTICS_Q"
-queue = "openstrap-analytics"
-
-[[queues.consumers]]
-queue = "openstrap-analytics"
-max_batch_size = 1
-max_batch_timeout = 10
-max_retries = 3
-dead_letter_queue = "openstrap-analytics-dlq"
-
-# Crons: 30-min sweep (re-derive dirty users → keeps "today" fresh; pure-read
-# endpoints serve this snapshot) + nightly full re-derive/prune. Any non-nightly
-# cron string falls through to the sweep branch in scheduled(); only "30 3 * * *"
-# triggers the nightly path. (Future: tighten the sweep to */15 if needed.)
-[triggers]
-crons = ["*/30 * * * *", "30 3 * * *"]
+# Native edge rate limiter — FREE (no D1, no extra cost). Protects the
+# unauthenticated, device-id-keyed ingest endpoints (/telemetry, /health/upload).
+# Optional in code: if this binding is absent the handlers simply skip the check.
+[[unsafe.bindings]]
+name = "RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
 
 [vars]
 EMAIL_FROM_NAME = "OpenStrap"

@@ -4,3 +4,6 @@ dist/
 .dev.vars
 .env
 *.log
+
+# Personal/operational files — never commit (secrets, wrangler configs)
+ops/

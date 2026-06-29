@@ -92,9 +92,11 @@ export function uuid(): string {
   return crypto.randomUUID()
 }
 
-// ---------- OTP email (pluggable provider; dev-code fallback on miss/failure) ----------
-// Provider selection: Brevo (single-sender, no domain) → Resend → dev fallback.
-// On any send failure we return dev_code so sign-in never dead-ends.
+// ---------- OTP email (pluggable provider) ----------
+// Provider selection: Brevo (single-sender, no domain) → Resend.
+// Returns delivered:false on miss/failure. The CODE IS NEVER RETURNED to the caller —
+// a failed/unconfigured provider must fail the sign-in closed, never leak the OTP.
+// (Self-hosters who don't want email set STATIC_OTP in the env instead — see issueOtp.)
 export interface EmailEnv {
   BREVO_API_KEY?: string
   RESEND_API_KEY?: string
@@ -109,7 +111,7 @@ const bodyText = (code: string) =>
 
 export async function sendOtpEmail(
   env: EmailEnv, to: string, code: string,
-): Promise<{ delivered: boolean; dev_code?: string }> {
+): Promise<{ delivered: boolean }> {
   const fromEmail = env.EMAIL_FROM ?? 'onboarding@resend.dev'
   const fromName = env.EMAIL_FROM_NAME ?? 'OpenStrap'
 
@@ -127,7 +129,7 @@ export async function sendOtpEmail(
       })
       if (!res.ok) {
         console.error('Brevo failed', res.status, await res.text())
-        return { delivered: false, dev_code: code }
+        return { delivered: false }
       }
       return { delivered: true }
     }
@@ -145,16 +147,16 @@ export async function sendOtpEmail(
       })
       if (!res.ok) {
         console.error('Resend failed', res.status, await res.text())
-        return { delivered: false, dev_code: code }
+        return { delivered: false }
       }
       return { delivered: true }
     }
   } catch (e) {
     console.error('email send threw', e)
-    return { delivered: false, dev_code: code }
+    return { delivered: false }
   }
 
-  // No provider configured — dev fallback.
-  console.log(`[dev-otp] ${to} -> ${code}`)
-  return { delivered: false, dev_code: code }
+  // No provider configured. Fail closed — caller returns an error (never the code).
+  console.error('[otp] no email provider configured (set BREVO_API_KEY/RESEND_API_KEY, or STATIC_OTP for self-host)')
+  return { delivered: false }
 }
