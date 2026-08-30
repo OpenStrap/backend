@@ -13,6 +13,8 @@ features — and nothing else. It does **not** receive your raw frames, it does 
 decode records, and it does **not** compute recovery, strain, sleep, or any other metric.
 All of that used to live here. It doesn't anymore.
 
+Questions about self-hosting your own instance? [Discord](https://discord.gg/dUXds5MWkd).
+
 ## What it actually does
 
 | Endpoint | What it's for | Required? |
